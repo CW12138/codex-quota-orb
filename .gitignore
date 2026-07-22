@@ -1,0 +1,26 @@
+# Local runtime and private QA artifacts
+.runtime/
+qa/
+*.log
+*.jsonl
+usage-cache*.json
+settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local packages and scratch files
+*.zip
+*.msi
+preview.png
+dist/

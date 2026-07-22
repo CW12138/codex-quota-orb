@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build portable package
+        shell: pwsh
+        run: |
+          $packageFiles = @(
+            'CodexRateWidget.ps1',
+            'UsageAnalytics.py',
+            'Watch-CodexAndLaunchWidget.ps1',
+            'Launch-CodexRateWidget.vbs',
+            'Launch-CodexRateWatcher.vbs',
+            'Install-Startup.ps1',
+            'Uninstall-Startup.ps1',
+            'Install.ps1',
+            'Install.cmd',
+            'Uninstall.ps1',
+            'Uninstall.cmd',
+            'README.md',
+            'CHANGELOG.md',
+            'PRIVACY.md',
+            'SECURITY.md',
+            'LICENSE',
+            'VERSION'
+          )
+          New-Item -ItemType Directory -Path dist\CodexQuotaOrb | Out-Null
+          Copy-Item -LiteralPath $packageFiles -Destination dist\CodexQuotaOrb
+          Compress-Archive -Path dist\CodexQuotaOrb -DestinationPath "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME.zip"
+          $hash = (Get-FileHash "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  CodexQuotaOrb-$env:GITHUB_REF_NAME.zip" | Set-Content dist\SHA256SUMS.txt -Encoding ascii
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME.zip" `
+            "dist\SHA256SUMS.txt" `
+            --title "Codex Quota Orb $env:GITHUB_REF_NAME" `
+            --generate-notes
