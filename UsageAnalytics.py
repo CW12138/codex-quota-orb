@@ -25,7 +25,6 @@ TOKEN_KEYS = (
 SKILL_PATH_RE = re.compile(r"[\\/]([^\\/\"']+)[\\/]SKILL\.md", re.IGNORECASE)
 EXPLICIT_SKILL_RE = re.compile(r"(?<![\w-])\$([A-Za-z0-9_.:-]+)")
 POWERSHELL_SCOPE_PREFIXES = ("env:", "global:", "local:", "private:", "script:")
-ROUTER_SKILLS = {"meisi"}
 MAX_SKILL_TRACE_LENGTH = 3
 
 
@@ -129,10 +128,8 @@ def discover_installed_skills(roots: list[Path]) -> list[str]:
 
 
 def choose_primary_skill(trace: list[str]) -> str | None:
-    if not trace:
-        return None
-    non_router = [name for name in trace if name.lower() not in ROUTER_SKILLS]
-    return non_router[-1] if non_router else trace[-1]
+    """Treat the final observed Skill as the primary executor, independent of its name."""
+    return trace[-1] if trace else None
 
 
 def choose_skill_trace(loaded_skills: Any, explicit_skills: Any) -> list[str]:
@@ -540,8 +537,8 @@ def aggregate(args: argparse.Namespace) -> dict[str, Any]:
                 chain_name = " \u2192 ".join(trace)
                 skill_chain_tokens[chain_name] += tokens
                 skill_chain_turns[chain_name] += 1
-                if trace[0].lower() in ROUTER_SKILLS:
-                    skill_router_turns[trace[0]] += 1
+                for routing_skill in trace[:-1]:
+                    skill_router_turns[routing_skill] += 1
 
     daily_rows = []
     for day_key in days:

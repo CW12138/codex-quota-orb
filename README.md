@@ -81,7 +81,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexRateWidget.ps1
 - **Installed Skills** are discovered from the local user Skill directory and remain visible even when their current value is zero.
 - **Primary Skill tokens** assign each attributed Turn once to the terminal observed Skill, so the primary total remains additive.
 - **Associated tokens** show every Skill involved in that Turn. They are intentionally non-additive and can sum beyond the local total.
-- **Route chains** preserve short evidence order such as `meisi → stat`. Bulk Skill catalogs are rejected as attribution evidence, and unattributed Turns remain explicit in the coverage figure.
+- **Route chains** preserve short evidence order such as `task-router → data-analysis`. Skill roles are inferred from their position in the observed chain rather than from personalized names. Bulk Skill catalogs are rejected as attribution evidence, and unattributed Turns remain explicit in the coverage figure.
 - **Agent attribution** uses local thread metadata and always keeps the main Agent separate.
 - Account-level daily usage may include other Codex surfaces or devices. Local Skill/Agent data only covers sessions found on this computer, so the two views intentionally use different denominators.
 
@@ -129,7 +129,7 @@ Codex Quota Orb 是一个 Windows 原生、本地优先的 Codex 额度悬浮窗
 - 不上传会话内容，不保存、显示或记录访问令牌，不调用模型生成。
 - 重置卡页面只查询可用张数和到期时间，不提供使用重置卡或充值入口。
 - Skill 页会列出本机已安装 Skill，包括当前为 0 的条目；“主归因 Token”只计最终 Skill，“关联 Token”不可相加。
-- 路由链按证据顺序显示，例如 `meisi → stat`；批量 Skill 清单不会被误判成全部调用。
+- 路由链按证据顺序显示，例如 `task-router → data-analysis`；角色由调用链中的位置判断，不依赖个人化 Skill 名称，批量 Skill 清单也不会被误判成全部调用。
 - 本地归因是透明的辅助统计，不伪装成官方精确计费。
 
 ## License

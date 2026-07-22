@@ -16,7 +16,7 @@
 
 - Added an installed-Skill inventory, including zero-use Skills.
 - Added exclusive terminal-Skill token attribution and non-additive associated Token totals.
-- Added ordered route-chain views such as `meisi → stat` without double-counting chain Token totals.
+- Added ordered route-chain views such as `task-router → data-analysis` without double-counting chain Token totals.
 - Reworked Skill and route rows into larger two-line layouts with full-width progress bars.
 - Rejected bulk Skill catalogs and PowerShell variable scopes as attribution evidence.
 

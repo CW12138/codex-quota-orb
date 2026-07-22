@@ -1713,7 +1713,7 @@ function Set-SkillView {
 
     if ($Name -eq 'chain') {
         $SkillSectionTitle.Text = 'SKILL · 前后路由逻辑'
-        $SkillHintText.Text = '按证据顺序记录“路由器 → 执行 Skill”；每条链的 Token 只计一次。'
+        $SkillHintText.Text = '按证据顺序记录“前置 Skill → 最终 Skill”；每条链的 Token 只计一次。'
     } elseif ($script:AnalyticsSnapshot) {
         $SkillSectionTitle.Text = 'SKILL · 主归因 TOKEN'
         $installedCount = [long]$script:AnalyticsSnapshot.installedSkillCount

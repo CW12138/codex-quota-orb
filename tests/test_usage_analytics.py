@@ -9,33 +9,33 @@ import UsageAnalytics as analytics
 
 
 CANONICAL_SKILLS = (
-    "grill-me",
-    "meisi",
-    "meisi-consult",
-    "meisi-outreach",
-    "meisi-poster",
-    "meisi-ppt",
-    "meisi-protocol",
-    "meisi-topic",
-    "meisi-write",
-    "ml-methodology-writing",
-    "score",
-    "stat",
+    "task-router",
+    "data-analysis",
+    "code-review",
+    "documentation",
+    "image-tools",
+    "issue-triage",
+    "planning",
+    "presentations",
+    "release-notes",
+    "spreadsheets",
+    "testing",
+    "web-research",
 )
 
 
 class UsageAnalyticsTests(unittest.TestCase):
     def test_trace_selection_rejects_bulk_catalogs(self) -> None:
         self.assertEqual(
-            analytics.choose_skill_trace(["meisi", "stat"], []),
-            ["meisi", "stat"],
+            analytics.choose_skill_trace(["task-router", "data-analysis"], []),
+            ["task-router", "data-analysis"],
         )
         self.assertEqual(
             analytics.choose_skill_trace([], list(CANONICAL_SKILLS)),
             [],
         )
-        self.assertEqual(analytics.choose_primary_skill(["meisi", "stat"]), "stat")
-        self.assertEqual(analytics.extract_explicit_skills("$env:PATH $stat"), ["stat"])
+        self.assertEqual(analytics.choose_primary_skill(["task-router", "data-analysis"]), "data-analysis")
+        self.assertEqual(analytics.extract_explicit_skills("$env:PATH $testing"), ["testing"])
 
     def test_installed_inventory_primary_tokens_and_route_chain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -58,7 +58,7 @@ class UsageAnalyticsTests(unittest.TestCase):
                     "type": "response_item",
                     "payload": {
                         "type": "function_call",
-                        "arguments": "Get-Content C:\\skills\\meisi\\SKILL.md; Get-Content C:\\skills\\stat\\SKILL.md",
+                        "arguments": "Get-Content C:\\skills\\task-router\\SKILL.md; Get-Content C:\\skills\\data-analysis\\SKILL.md",
                     },
                 },
                 {
@@ -88,14 +88,14 @@ class UsageAnalyticsTests(unittest.TestCase):
             rows = {row["name"]: row for row in result["skills"]}
             self.assertEqual(result["installedSkillCount"], 12)
             self.assertEqual(len(result["skills"]), 12)
-            self.assertEqual(rows["stat"]["tokens"], 100)
-            self.assertEqual(rows["stat"]["associatedTokens"], 100)
-            self.assertEqual(rows["meisi"]["tokens"], 0)
-            self.assertEqual(rows["meisi"]["associatedTokens"], 100)
-            self.assertEqual(rows["meisi"]["routerTurns"], 1)
+            self.assertEqual(rows["data-analysis"]["tokens"], 100)
+            self.assertEqual(rows["data-analysis"]["associatedTokens"], 100)
+            self.assertEqual(rows["task-router"]["tokens"], 0)
+            self.assertEqual(rows["task-router"]["associatedTokens"], 100)
+            self.assertEqual(rows["task-router"]["routerTurns"], 1)
             self.assertEqual(result["unattributedSkillTokens"], 50)
             self.assertEqual(sum(row["tokens"] for row in result["skills"]), 100)
-            self.assertEqual(result["skillChains"][0]["name"], "meisi → stat")
+            self.assertEqual(result["skillChains"][0]["name"], "task-router → data-analysis")
             self.assertEqual(result["skillChains"][0]["tokens"], 100)
 
 
