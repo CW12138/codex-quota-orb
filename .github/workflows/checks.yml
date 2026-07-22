@@ -28,3 +28,12 @@ jobs:
           if ($failed) { exit 1 }
       - name: Compile analytics module
         run: python -m py_compile UsageAnalytics.py
+      - name: Run analytics tests
+        run: python -m unittest discover -s tests -v
+      - name: Run PowerShell contract tests
+        shell: pwsh
+        run: |
+          Get-ChildItem tests -Filter *.ps1 | ForEach-Object {
+            & $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

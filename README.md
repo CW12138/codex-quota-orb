@@ -18,11 +18,24 @@ Codex Quota Orb is a lightweight, local-first Windows widget. Its liquid orb sho
 ## Highlights
 
 - Live weekly quota from the local Codex app server, with session-event fallback.
+- Read-only Reset Credits count and per-card expiry times, with no redeem or purchase action.
 - Daily account token trends when the account usage interface is available.
-- Local Skill and Agent attribution, with coverage shown explicitly.
+- Installed-Skill inventory, terminal-Skill attribution, ordered route chains, and Agent attribution.
 - Floating liquid-glass orb, expandable panel, drag support, and system tray controls.
 - No telemetry, ads, analytics service, or model calls.
 - Runs as native PowerShell/WPF; Python is only needed for the optional analytics page.
+
+## Read-only Reset Credits
+
+<p align="center">
+  <img src="assets/reset-credits.png" alt="Codex Quota Orb read-only Reset Credits page" width="400">
+</p>
+
+- Opens as a separate liquid-glass page from the quota details view.
+- Shows the available card count plus each card's local expiry time and remaining lifetime.
+- Numbers cards and sorts them by the earliest expiry time.
+- Queries once when the page opens; its refresh button only re-reads Reset Credits and does not refresh weekly quota.
+- Provides explicit empty and retry states, with no redeem, reset, purchase, or top-up action.
 
 ## Install
 
@@ -48,6 +61,7 @@ Prefer to inspect scripts before running them? Download or clone the repository,
 ## Use
 
 - Click the orb to expand quota details.
+- Select **View reset credits** to query the available count and expiry time of each card.
 - Drag the orb to move it.
 - Select **View usage analytics** for 7-day, Skill, and Agent views.
 - Use **—** to collapse back to the orb.
@@ -62,8 +76,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexRateWidget.ps1
 ## What the numbers mean
 
 - **Weekly quota** comes from `account/rateLimits/read` when available. It is not estimated from raw tokens.
+- **Reset Credits** are queried on demand from the official account service and sorted by the earliest expiry time. The widget never redeems a card.
 - **Daily tokens** come from `account/usage/read.dailyUsageBuckets` when available, with local session-event fallback.
-- **Skill attribution** is turn-based: single Skill, multiple Skills, and unattributed turns remain separate. Multi-Skill turns are not split using arbitrary weights.
+- **Installed Skills** are discovered from the local user Skill directory and remain visible even when their current value is zero.
+- **Primary Skill tokens** assign each attributed Turn once to the terminal observed Skill, so the primary total remains additive.
+- **Associated tokens** show every Skill involved in that Turn. They are intentionally non-additive and can sum beyond the local total.
+- **Route chains** preserve short evidence order such as `meisi → stat`. Bulk Skill catalogs are rejected as attribution evidence, and unattributed Turns remain explicit in the coverage figure.
 - **Agent attribution** uses local thread metadata and always keeps the main Agent separate.
 - Account-level daily usage may include other Codex surfaces or devices. Local Skill/Agent data only covers sessions found on this computer, so the two views intentionally use different denominators.
 
@@ -71,8 +89,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexRateWidget.ps1
 
 Codex Quota Orb is local-first:
 
-- It reads quota through the locally installed Codex app server and reads local Codex session files for fallback and attribution.
-- It does not read, display, or store access tokens.
+- It reads quota through the locally installed Codex app server, reads local Codex session files for fallback and attribution, and makes a read-only Reset Credits lookup when that page is opened.
+- It uses the local Codex ChatGPT login token only in memory for that lookup; it never displays, stores, copies, or logs the token.
 - It sends no widget telemetry and makes no model-generation requests.
 - Runtime data stays under `%LOCALAPPDATA%\CodexRateWidget`.
 
@@ -104,11 +122,14 @@ python -m py_compile .\UsageAnalytics.py
 
 ## 中文说明
 
-Codex Quota Orb 是一个 Windows 原生、本地优先的 Codex 额度悬浮窗。水球显示周额度剩余百分比，点击后可查看额度详情、近 7 日 Token，以及本机 Skill/Agent 归因统计。
+Codex Quota Orb 是一个 Windows 原生、本地优先的 Codex 额度悬浮窗。水球显示周额度剩余百分比，点击后可查看额度详情、重置卡余量与到期时间、近 7 日 Token，以及本机 Skill/Agent 归因统计。
 
 - 一行命令安装，无需管理员权限。
 - 主额度页不依赖 Python；统计页需要 Python 3.10+。
-- 不上传会话内容，不读取或显示访问令牌，不调用模型生成。
+- 不上传会话内容，不保存、显示或记录访问令牌，不调用模型生成。
+- 重置卡页面只查询可用张数和到期时间，不提供使用重置卡或充值入口。
+- Skill 页会列出本机已安装 Skill，包括当前为 0 的条目；“主归因 Token”只计最终 Skill，“关联 Token”不可相加。
+- 路由链按证据顺序显示，例如 `meisi → stat`；批量 Skill 清单不会被误判成全部调用。
 - 本地归因是透明的辅助统计，不伪装成官方精确计费。
 
 ## License

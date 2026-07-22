@@ -2,10 +2,11 @@
     [switch]$ShowDiagnostics,
     [switch]$HeadlessProbe,
     [switch]$DirectWorker,
+    [switch]$ResetCreditsWorker,
     [switch]$QASolidWindow,
     [string]$QARenderPath,
     [ValidateRange(0, 100)][double]$QARemaining = 64.0,
-    [ValidateSet('orb', 'capacity', 'daily', 'skill', 'agent')][string]$QAView = 'orb',
+    [ValidateSet('orb', 'capacity', 'daily', 'skill', 'skill-chain', 'agent', 'reset-credits')][string]$QAView = 'orb',
     [int]$AutoCloseSeconds = 0
 )
 
@@ -20,7 +21,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $mutex = $null
-if (-not $HeadlessProbe -and -not $DirectWorker -and -not $QARenderPath) {
+if (-not $HeadlessProbe -and -not $DirectWorker -and -not $ResetCreditsWorker -and -not $QARenderPath) {
     $createdNew = $false
     $mutex = New-Object System.Threading.Mutex($true, 'Local\CodexRateLimitWidget', [ref]$createdNew)
     if (-not $createdNew) {
@@ -55,10 +56,14 @@ $script:ExitRequested = $false
 $script:IsRefreshing = $false
 $script:DirectWorkerProcess = $null
 $script:PendingDirectRefresh = $false
+$script:ResetCreditsWorkerProcess = $null
+$script:IsResetCreditsRefreshing = $false
+$script:ResetCreditsSnapshot = $null
 $script:IsAnalyticsRefreshing = $false
 $script:AnalyticsSnapshot = $null
 $script:AccountUsage = $null
 $script:ActiveAnalyticsTab = 'daily'
+$script:ActiveSkillView = 'primary'
 $script:LastRateHistorySignature = $null
 $script:ViewMode = 'orb'
 $script:OrbWaterLevel = 0.0
@@ -122,6 +127,81 @@ function Get-CodexHomeCandidates {
     return $homes |
         Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
         Select-Object -Unique
+}
+
+function Read-CodexChatGptAuth {
+    foreach ($codexHome in (Get-CodexHomeCandidates)) {
+        $authPath = Join-Path $codexHome 'auth.json'
+        if (-not (Test-Path -LiteralPath $authPath -PathType Leaf)) { continue }
+
+        try {
+            $auth = Get-Content -LiteralPath $authPath -Encoding UTF8 -Raw | ConvertFrom-Json
+            if ($auth.tokens -and $auth.tokens.access_token) {
+                return [pscustomobject]@{
+                    AccessToken = [string]$auth.tokens.access_token
+                    AccountId   = if ($auth.tokens.account_id) { [string]$auth.tokens.account_id } else { $null }
+                }
+            }
+        } catch {
+            Write-Diagnostic 'Codex 登录信息暂时不可读取。'
+        }
+    }
+
+    throw '未找到可用的 Codex ChatGPT 登录。'
+}
+
+function Read-ResetCreditsFromOfficialService {
+    $auth = Read-CodexChatGptAuth
+    $headers = @{
+        Authorization = ('Bearer ' + $auth.AccessToken)
+        Accept        = 'application/json'
+        'User-Agent'  = 'CodexQuotaOrb/1.2.0'
+    }
+    if ($auth.AccountId) {
+        $headers['ChatGPT-Account-Id'] = $auth.AccountId
+    }
+
+    try {
+        # Read-only endpoint used by the installed Codex app. Never call the
+        # separate consume endpoint from this project.
+        $response = Invoke-RestMethod -Method Get `
+            -Uri 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits' `
+            -Headers $headers -TimeoutSec 15
+    } catch {
+        $statusCode = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        if ($statusCode -eq 401 -or $statusCode -eq 403) {
+            throw 'Codex 登录已失效，请先在 Codex App 或 CLI 中重新登录。'
+        }
+        throw '重置卡服务暂时无法读取。'
+    }
+
+    $availableCredits = New-Object System.Collections.Generic.List[object]
+    foreach ($credit in @($response.credits)) {
+        if (-not $credit) { continue }
+        if ([string]$credit.status -ne 'available') { continue }
+        if ($credit.PSObject.Properties['is_supported_by_plan'] -and -not [bool]$credit.is_supported_by_plan) { continue }
+        if (-not $credit.expires_at) { continue }
+
+        try {
+            $expiresAt = [DateTimeOffset]::Parse([string]$credit.expires_at).ToLocalTime()
+        } catch {
+            continue
+        }
+
+        $availableCredits.Add([pscustomobject]@{ ExpiresAt = $expiresAt })
+    }
+
+    $serverCount = if ($response.PSObject.Properties['available_count']) {
+        [Math]::Max(0, [int]$response.available_count)
+    } else {
+        $availableCredits.Count
+    }
+
+    return [pscustomobject]@{
+        AvailableCount = $serverCount
+        Credits        = @($availableCredits | Sort-Object ExpiresAt)
+        ObservedAt     = [DateTimeOffset]::Now
+    }
 }
 
 function ConvertTo-RateSnapshot {
@@ -192,7 +272,7 @@ function Read-AccountDataFromAppServer {
                 clientInfo = @{
                     name = 'codex_rate_widget'
                     title = 'Codex Quota Orb'
-                    version = '1.0.0'
+                    version = '1.2.0'
                 }
             }
         } | ConvertTo-Json -Compress -Depth 8
@@ -370,6 +450,25 @@ if ($DirectWorker) {
     exit 0
 }
 
+if ($ResetCreditsWorker) {
+    try {
+        $resetCredits = Read-ResetCreditsFromOfficialService
+        [pscustomobject]@{
+            AvailableCount = [int]$resetCredits.AvailableCount
+            Credits        = @($resetCredits.Credits | ForEach-Object {
+                [pscustomobject]@{
+                    ExpiresEpoch = ([DateTimeOffset]$_.ExpiresAt).ToUnixTimeSeconds()
+                }
+            })
+            ObservedEpoch  = ([DateTimeOffset]$resetCredits.ObservedAt).ToUnixTimeMilliseconds()
+        } | ConvertTo-Json -Compress -Depth 5
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine('RESET_CREDITS_QUERY_FAILED')
+        exit 1
+    }
+}
+
 if ($HeadlessProbe) {
     try {
         try {
@@ -403,9 +502,11 @@ if ($HeadlessProbe) {
         TextOptions.TextFormattingMode="Display"
         TextOptions.TextRenderingMode="Grayscale"
         TextOptions.TextHintingMode="Fixed"
-        FontFamily="Segoe UI Variable Display, Segoe UI"
+        FontFamily="SF Pro Text, PingFang SC, Microsoft YaHei UI, Segoe UI"
         FontWeight="Medium">
     <Window.Resources>
+        <FontFamily x:Key="InterfaceTextFont">SF Pro Text, PingFang SC, Microsoft YaHei UI, Segoe UI</FontFamily>
+        <FontFamily x:Key="InterfaceDisplayFont">SF Pro Display, SF Pro Text, PingFang SC, Microsoft YaHei UI, Segoe UI</FontFamily>
         <LinearGradientBrush x:Key="GlassEdgeBrush" StartPoint="0,0" EndPoint="1,1">
             <GradientStop Color="#A6FFFFFF" Offset="0"/>
             <GradientStop Color="#48DDF5FF" Offset="0.18"/>
@@ -481,7 +582,7 @@ if ($HeadlessProbe) {
             <Setter Property="Background" Value="#2E79BFF4"/>
             <Setter Property="BorderBrush" Value="#66DDF5FF"/>
             <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI"/>
+            <Setter Property="FontFamily" Value="{StaticResource InterfaceTextFont}"/>
             <Setter Property="FontSize" Value="11"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="Cursor" Value="Hand"/>
@@ -754,7 +855,7 @@ if ($HeadlessProbe) {
                         </RadialGradientBrush>
                     </Ellipse.Fill>
                 </Ellipse>
-                <TextBlock x:Name="OrbPercentText" Text="--%" Foreground="#FF101923" FontFamily="Segoe UI Variable Display, Segoe UI" FontSize="18" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False">
+                <TextBlock x:Name="OrbPercentText" Text="--%" Foreground="#FF101923" FontFamily="{StaticResource InterfaceDisplayFont}" FontSize="18" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False">
                     <TextBlock.Effect>
                         <DropShadowEffect Color="#FFFFFF" BlurRadius="3" ShadowDepth="0" Opacity="0.72"/>
                     </TextBlock.Effect>
@@ -770,7 +871,7 @@ if ($HeadlessProbe) {
                             </PathGeometry.Transform>
                         </PathGeometry>
                     </Grid.Clip>
-                    <TextBlock x:Name="OrbPercentWaterText" Text="--%" Foreground="#FFFFFFFF" FontFamily="Segoe UI Variable Display, Segoe UI" FontSize="18" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock x:Name="OrbPercentWaterText" Text="--%" Foreground="#FFFFFFFF" FontFamily="{StaticResource InterfaceDisplayFont}" FontSize="18" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center">
                         <TextBlock.Effect>
                             <DropShadowEffect Color="#071529" BlurRadius="3" ShadowDepth="1" Opacity="0.9"/>
                         </TextBlock.Effect>
@@ -856,7 +957,7 @@ if ($HeadlessProbe) {
                             <RowDefinition Height="60"/>
                         </Grid.RowDefinitions>
                         <TextBlock Grid.Row="0" Text="R E M A I N I N G" Foreground="#BFFFFFFF" FontSize="9" FontWeight="Bold" VerticalAlignment="Top"/>
-                        <TextBlock x:Name="PercentText" Grid.Row="1" Text="--%" Foreground="#FFFFFFFF" FontFamily="Segoe UI Variable Display, Segoe UI" FontSize="48" FontWeight="Bold" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="PercentText" Grid.Row="1" Text="--%" Foreground="#FFFFFFFF" FontFamily="{StaticResource InterfaceDisplayFont}" FontSize="48" FontWeight="Bold" VerticalAlignment="Center"/>
                     </Grid>
                     <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
                         <Border x:Name="SourceBadge" Background="#242A4E76" CornerRadius="10" Padding="10,5">
@@ -886,9 +987,8 @@ if ($HeadlessProbe) {
                     </StackPanel>
                 </Grid>
 
-                <TextBlock x:Name="HintText" Grid.Row="4" Text="读取服务端额度快照，不发送模型消息" Foreground="#9FFFFFFF" FontSize="10" FontWeight="SemiBold" Margin="0,11,0,0"/>
-
-                <Button x:Name="AnalyticsButton" Grid.Row="5" Content="查看用量分析  ›" Style="{StaticResource ActionButton}" Margin="0,10,0,0"/>
+                <Button x:Name="AnalyticsButton" Grid.Row="4" Content="查看用量分析  ›" Style="{StaticResource ActionButton}" Margin="0,12,0,0"/>
+                <Button x:Name="ResetCreditsButton" Grid.Row="5" Content="查看重置卡  ›" Style="{StaticResource ActionButton}" Margin="0,8,0,0"/>
             </Grid>
         </Border>
 
@@ -996,17 +1096,27 @@ if ($HeadlessProbe) {
                     <Grid x:Name="SkillPanel" Visibility="Collapsed">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
                             <RowDefinition Height="*"/>
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
                         <Grid Grid.Row="0" Margin="1,4,1,7">
-                            <TextBlock Text="SKILL · TURN 归因" Foreground="#D0FFFFFF" FontSize="10" FontWeight="Bold"/>
+                            <TextBlock x:Name="SkillSectionTitle" Text="SKILL · 主归因 TOKEN" Foreground="#D0FFFFFF" FontSize="10" FontWeight="Bold"/>
                             <TextBlock x:Name="SkillCoverageText" Text="覆盖率 --" Foreground="#64AFFF" FontSize="9" FontWeight="Bold" HorizontalAlignment="Right"/>
                         </Grid>
-                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                            <StackPanel x:Name="SkillRowsPanel"/>
-                        </ScrollViewer>
-                        <TextBlock Grid.Row="2" Text="多 Skill 不平均分摊；无法可靠识别的 Turn 归入“未归因”。" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
+                        <UniformGrid Grid.Row="1" Columns="2" Margin="0,0,0,6">
+                            <Button x:Name="SkillPrimaryButton" Content="12 Skill" Style="{StaticResource TabButton}"/>
+                            <Button x:Name="SkillChainButton" Content="路由链" Style="{StaticResource TabButton}" Margin="0"/>
+                        </UniformGrid>
+                        <Grid Grid.Row="2">
+                            <ScrollViewer x:Name="SkillPrimaryScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <StackPanel x:Name="SkillRowsPanel"/>
+                            </ScrollViewer>
+                            <ScrollViewer x:Name="SkillChainScroll" Visibility="Collapsed" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <StackPanel x:Name="SkillChainRowsPanel"/>
+                            </ScrollViewer>
+                        </Grid>
+                        <TextBlock x:Name="SkillHintText" Grid.Row="3" Text="主归因只计最终 Skill；关联 Token 不可相加。" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
                     </Grid>
 
                     <Grid x:Name="AgentPanel" Visibility="Collapsed">
@@ -1027,6 +1137,89 @@ if ($HeadlessProbe) {
                 </Grid>
 
                 <TextBlock x:Name="AnalyticsStatusText" Grid.Row="4" Text="准备本地统计…" Foreground="#9FFFFFFF" FontSize="9" VerticalAlignment="Bottom" TextTrimming="CharacterEllipsis"/>
+            </Grid>
+        </Border>
+
+        <Border x:Name="ResetCreditsBorder" Margin="12" Visibility="Collapsed" CornerRadius="32" BorderThickness="1" BorderBrush="{StaticResource GlassEdgeBrush}">
+            <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                    <GradientStop Color="#AD121A24" Offset="0"/>
+                    <GradientStop Color="#9F070C13" Offset="0.52"/>
+                    <GradientStop Color="#A7102532" Offset="1"/>
+                </LinearGradientBrush>
+            </Border.Background>
+            <Border.Effect>
+                <DropShadowEffect Color="#020815" BlurRadius="28" ShadowDepth="7" Opacity="0.48"/>
+            </Border.Effect>
+            <Grid Margin="21,17,21,17">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="38"/>
+                    <RowDefinition Height="76"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <Border Grid.RowSpan="3" Margin="-8,-6,-8,-6" CornerRadius="24" IsHitTestVisible="False">
+                    <Border.Background>
+                        <RadialGradientBrush Center="0.18,0.05" GradientOrigin="0.12,0.02" RadiusX="0.92" RadiusY="0.8">
+                            <GradientStop Color="#42FFFFFF" Offset="0"/>
+                            <GradientStop Color="#183D9BC4" Offset="0.38"/>
+                            <GradientStop Color="#00001536" Offset="1"/>
+                        </RadialGradientBrush>
+                    </Border.Background>
+                </Border>
+                <Border Grid.RowSpan="3" Margin="-8,-6,-8,-6" CornerRadius="24" Background="{StaticResource GlassSpecularBrush}" Opacity="0.9" IsHitTestVisible="False"/>
+                <Border Grid.RowSpan="3" Margin="-8,-6,-8,-6" CornerRadius="24" IsHitTestVisible="False">
+                    <Border.Background>
+                        <RadialGradientBrush Center="0.76,1.05" GradientOrigin="0.82,1.08" RadiusX="0.84" RadiusY="0.46">
+                            <GradientStop Color="#323C91B8" Offset="0"/>
+                            <GradientStop Color="#16215470" Offset="0.38"/>
+                            <GradientStop Color="#00000000" Offset="0.76"/>
+                        </RadialGradientBrush>
+                    </Border.Background>
+                </Border>
+                <Border Grid.RowSpan="3" Margin="-8,-6,-8,-6" CornerRadius="24" Background="{StaticResource GlassTexture}" Opacity="0.22" IsHitTestVisible="False"/>
+                <Border Grid.RowSpan="3" Margin="-5,-3,-5,-3" CornerRadius="22" BorderThickness="1.15" BorderBrush="{StaticResource GlassInnerEdgeBrush}" IsHitTestVisible="False"/>
+                <Border Grid.RowSpan="3" Margin="-2,0,-2,0" CornerRadius="19" BorderThickness="1" BorderBrush="#36000000" IsHitTestVisible="False"/>
+
+                <Grid Grid.Row="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Button x:Name="ResetCreditsBackButton" Grid.Column="0" Style="{StaticResource WindowButton}" Content="‹" ToolTip="返回额度页" Margin="0,0,8,0"/>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock Text="C O D E X" Foreground="#BFFFFFFF" FontSize="9" FontWeight="Bold"/>
+                        <TextBlock Text="Reset credits" Foreground="#F5FFFFFF" FontSize="15" FontWeight="Bold" Margin="0,-1,0,0"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button x:Name="ResetCreditsRefreshButton" Style="{StaticResource WindowButton}" Content="↻" ToolTip="重新查询重置卡"/>
+                        <Button x:Name="ResetCreditsHideButton" Style="{StaticResource WindowButton}" Content="—" ToolTip="收拢为水球"/>
+                        <Button x:Name="ResetCreditsCloseButton" Style="{StaticResource WindowButton}" Content="×" ToolTip="退出"/>
+                    </StackPanel>
+                </Grid>
+
+                <Border Grid.Row="1" Margin="0,9,0,4" Padding="14,9" CornerRadius="17" Background="#24FFFFFF" BorderBrush="#38FFFFFF" BorderThickness="1">
+                    <Grid>
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock Text="A V A I L A B L E" Foreground="#8FFFFFFF" FontSize="8" FontWeight="Bold"/>
+                            <TextBlock x:Name="ResetCreditsCountText" Text="查询中…" Foreground="#FFFFFFFF" FontSize="25" FontWeight="Bold" Margin="0,1,0,0"/>
+                        </StackPanel>
+                        <Border HorizontalAlignment="Right" VerticalAlignment="Center" Background="#2430D158" CornerRadius="10" Padding="10,5">
+                            <TextBlock Text="只读查询" Foreground="#7EE39A" FontSize="9" FontWeight="Bold"/>
+                        </Border>
+                    </Grid>
+                </Border>
+
+                <Grid Grid.Row="2" Margin="0,11,0,0">
+                    <ScrollViewer x:Name="ResetCreditsScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel x:Name="ResetCreditsRowsPanel"/>
+                    </ScrollViewer>
+                    <StackPanel x:Name="ResetCreditsStatePanel" HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="260">
+                        <TextBlock x:Name="ResetCreditsStateText" Text="正在查询重置卡…" Foreground="#BFFFFFFF" FontSize="11" FontWeight="SemiBold" TextAlignment="Center" TextWrapping="Wrap"/>
+                        <Button x:Name="ResetCreditsRetryButton" Content="重新查询" Style="{StaticResource ActionButton}" Width="150" Margin="0,14,0,0" Visibility="Collapsed"/>
+                    </StackPanel>
+                </Grid>
             </Grid>
         </Border>
     </Grid>
@@ -1066,8 +1259,8 @@ $ProgressTrack = $window.FindName('ProgressTrack')
 $CapacityFill = $window.FindName('CapacityFill')
 $ResetText = $window.FindName('ResetText')
 $UpdatedText = $window.FindName('UpdatedText')
-$HintText = $window.FindName('HintText')
 $AnalyticsButton = $window.FindName('AnalyticsButton')
+$ResetCreditsButton = $window.FindName('ResetCreditsButton')
 $RefreshButton = $window.FindName('RefreshButton')
 $HideButton = $window.FindName('HideButton')
 $CloseButton = $window.FindName('CloseButton')
@@ -1087,11 +1280,29 @@ $SkillPanel = $window.FindName('SkillPanel')
 $AgentPanel = $window.FindName('AgentPanel')
 $DailyRowsPanel = $window.FindName('DailyRowsPanel')
 $SkillRowsPanel = $window.FindName('SkillRowsPanel')
+$SkillChainRowsPanel = $window.FindName('SkillChainRowsPanel')
 $AgentRowsPanel = $window.FindName('AgentRowsPanel')
 $DailySourceText = $window.FindName('DailySourceText')
 $RateHistoryText = $window.FindName('RateHistoryText')
 $SkillCoverageText = $window.FindName('SkillCoverageText')
+$SkillSectionTitle = $window.FindName('SkillSectionTitle')
+$SkillPrimaryButton = $window.FindName('SkillPrimaryButton')
+$SkillChainButton = $window.FindName('SkillChainButton')
+$SkillPrimaryScroll = $window.FindName('SkillPrimaryScroll')
+$SkillChainScroll = $window.FindName('SkillChainScroll')
+$SkillHintText = $window.FindName('SkillHintText')
 $AnalyticsStatusText = $window.FindName('AnalyticsStatusText')
+$ResetCreditsBorder = $window.FindName('ResetCreditsBorder')
+$ResetCreditsBackButton = $window.FindName('ResetCreditsBackButton')
+$ResetCreditsRefreshButton = $window.FindName('ResetCreditsRefreshButton')
+$ResetCreditsHideButton = $window.FindName('ResetCreditsHideButton')
+$ResetCreditsCloseButton = $window.FindName('ResetCreditsCloseButton')
+$ResetCreditsCountText = $window.FindName('ResetCreditsCountText')
+$ResetCreditsScroll = $window.FindName('ResetCreditsScroll')
+$ResetCreditsRowsPanel = $window.FindName('ResetCreditsRowsPanel')
+$ResetCreditsStatePanel = $window.FindName('ResetCreditsStatePanel')
+$ResetCreditsStateText = $window.FindName('ResetCreditsStateText')
+$ResetCreditsRetryButton = $window.FindName('ResetCreditsRetryButton')
 
 function New-Brush {
     param([string]$Color)
@@ -1229,11 +1440,9 @@ function Apply-Snapshot {
     if ($Snapshot.Source -eq 'direct') {
         $SourceText.Text = 'LIVE API'
         $SourceText.Foreground = $accentBrush
-        $HintText.Text = 'app-server 直读 · 不发送模型消息'
     } else {
         $SourceText.Text = 'EVENT SNAPSHOT'
         $SourceText.Foreground = $accentBrush
-        $HintText.Text = '服务端事件快照 · 新响应到达时自动更新'
     }
 
     Update-Countdown
@@ -1252,10 +1461,9 @@ function Apply-EmptyState {
     Update-OrbWaterLevel 0
     $CapacityFill.Width = 0
     $SourceText.Text = 'WAITING'
-    $UsedText.Text = '尚无可用额度快照'
+    $UsedText.Text = $Message
     $ResetText.Text = '启动 Codex 完成一次响应后自动出现'
     $UpdatedText.Text = '--:--'
-    $HintText.Text = $Message
 }
 
 function Format-TokenCount {
@@ -1281,7 +1489,7 @@ function Render-UsageRows {
     param(
         $Panel,
         $Rows,
-        [ValidateSet('daily', 'skill', 'agent')][string]$Mode
+        [ValidateSet('daily', 'skill', 'chain', 'agent')][string]$Mode
     )
 
     $Panel.Children.Clear()
@@ -1299,18 +1507,27 @@ function Render-UsageRows {
     $palette = @('#0A84FF', '#64D2FF', '#5E5CE6', '#BF5AF2', '#30D158', '#FFD60A', '#FF9F0A', '#FF453A')
     $index = 0
     foreach ($item in $items) {
+        $stackedLayout = $Mode -in @('skill', 'chain')
         $row = [System.Windows.Controls.Grid]::new()
-        $row.Height = 36
-        $row.Margin = '0,0,0,2'
+        $row.Height = if ($Mode -eq 'skill') { 60 } elseif ($Mode -eq 'chain') { 50 } else { 36 }
+        $row.Margin = if ($stackedLayout) { '0,0,0,4' } else { '0,0,0,2' }
+        if ($stackedLayout) {
+            $topRow = [System.Windows.Controls.RowDefinition]::new()
+            $topRow.Height = '*'
+            $barRow = [System.Windows.Controls.RowDefinition]::new()
+            $barRow.Height = '14'
+            [void]$row.RowDefinitions.Add($topRow)
+            [void]$row.RowDefinitions.Add($barRow)
+        }
 
         $labelColumn = [System.Windows.Controls.ColumnDefinition]::new()
-        $labelColumn.Width = '126'
+        $labelColumn.Width = if ($stackedLayout) { '*' } else { '126' }
         $barColumn = [System.Windows.Controls.ColumnDefinition]::new()
-        $barColumn.Width = '*'
+        $barColumn.Width = if ($stackedLayout) { '0' } else { '*' }
         $valueColumn = [System.Windows.Controls.ColumnDefinition]::new()
-        $valueColumn.Width = '76'
+        $valueColumn.Width = if ($stackedLayout) { '72' } else { '76' }
         $percentColumn = [System.Windows.Controls.ColumnDefinition]::new()
-        $percentColumn.Width = '48'
+        $percentColumn.Width = if ($stackedLayout) { '48' } else { '48' }
         [void]$row.ColumnDefinitions.Add($labelColumn)
         [void]$row.ColumnDefinitions.Add($barColumn)
         [void]$row.ColumnDefinitions.Add($valueColumn)
@@ -1328,19 +1545,52 @@ function Render-UsageRows {
             Get-AnalyticsLabel ([string]$item.name)
         }
 
-        $label = [System.Windows.Controls.TextBlock]::new()
-        $label.Text = $labelText
-        $label.Foreground = New-Brush '#D1D1D6'
-        $label.FontSize = 10
-        $label.FontWeight = 'SemiBold'
-        $label.VerticalAlignment = 'Center'
-        $label.TextTrimming = 'CharacterEllipsis'
+        if ($Mode -eq 'skill') {
+            $label = [System.Windows.Controls.StackPanel]::new()
+            $label.VerticalAlignment = 'Center'
+            $label.ToolTip = ('主归因 {0} · 关联 {1} · 参与 {2} Turn · 路由 {3} Turn' -f `
+                (Format-TokenCount ([long]$item.tokens)),
+                (Format-TokenCount ([long]$item.associatedTokens)),
+                ([long]$item.turns),
+                ([long]$item.routerTurns))
+
+            $skillName = [System.Windows.Controls.TextBlock]::new()
+            $skillName.Text = $labelText
+            $skillName.Foreground = New-Brush $(if ([long]$item.turns -gt 0) { '#D1D1D6' } else { '#70FFFFFF' })
+            $skillName.FontSize = 11
+            $skillName.FontWeight = 'SemiBold'
+            $skillName.TextTrimming = 'CharacterEllipsis'
+
+            $skillDetail = [System.Windows.Controls.TextBlock]::new()
+            $skillDetail.Text = if ([long]$item.turns -gt 0) {
+                '关联 {0} · {1}T' -f (Format-TokenCount ([long]$item.associatedTokens)), ([long]$item.turns)
+            } else {
+                '未参与 · 0T'
+            }
+            $skillDetail.Foreground = New-Brush '#78FFFFFF'
+            $skillDetail.FontSize = 9
+            $skillDetail.Margin = '0,1,0,0'
+            [void]$label.Children.Add($skillName)
+            [void]$label.Children.Add($skillDetail)
+        } else {
+            $label = [System.Windows.Controls.TextBlock]::new()
+            $label.Text = $labelText
+            $label.Foreground = New-Brush '#D1D1D6'
+            $label.FontSize = if ($Mode -eq 'chain') { 11 } else { 10 }
+            $label.FontWeight = 'SemiBold'
+            $label.VerticalAlignment = 'Center'
+            $label.TextTrimming = 'CharacterEllipsis'
+            if ($Mode -eq 'chain') {
+                $label.ToolTip = ('{0} · {1} Turn' -f $labelText, ([long]$item.turns))
+            }
+        }
         [System.Windows.Controls.Grid]::SetColumn($label, 0)
+        if ($stackedLayout) { [System.Windows.Controls.Grid]::SetRow($label, 0) }
 
         $shareValue = [Math]::Max(0.0, [Math]::Min(100.0, [double]$item.sharePercent))
         $barHost = [System.Windows.Controls.Grid]::new()
-        $barHost.Height = 7
-        $barHost.Margin = '4,0,12,0'
+        $barHost.Height = if ($stackedLayout) { 8 } else { 7 }
+        $barHost.Margin = if ($stackedLayout) { '0,3,0,3' } else { '4,0,12,0' }
         $barHost.VerticalAlignment = 'Center'
         $filledColumn = [System.Windows.Controls.ColumnDefinition]::new()
         $filledColumn.Width = [System.Windows.GridLength]::new([Math]::Max(0.01, $shareValue), [System.Windows.GridUnitType]::Star)
@@ -1358,23 +1608,31 @@ function Render-UsageRows {
         [System.Windows.Controls.Grid]::SetColumn($fill, 0)
         [void]$barHost.Children.Add($track)
         [void]$barHost.Children.Add($fill)
-        [System.Windows.Controls.Grid]::SetColumn($barHost, 1)
+        if ($stackedLayout) {
+            [System.Windows.Controls.Grid]::SetRow($barHost, 1)
+            [System.Windows.Controls.Grid]::SetColumn($barHost, 0)
+            [System.Windows.Controls.Grid]::SetColumnSpan($barHost, 4)
+        } else {
+            [System.Windows.Controls.Grid]::SetColumn($barHost, 1)
+        }
 
         $value = [System.Windows.Controls.TextBlock]::new()
         $value.Text = Format-TokenCount ([long]$item.tokens)
         $value.Foreground = New-Brush '#D0FFFFFF'
-        $value.FontSize = 10
+        $value.FontSize = if ($stackedLayout) { 11 } else { 10 }
         $value.HorizontalAlignment = 'Right'
         $value.VerticalAlignment = 'Center'
         [System.Windows.Controls.Grid]::SetColumn($value, 2)
+        if ($stackedLayout) { [System.Windows.Controls.Grid]::SetRow($value, 0) }
 
         $percent = [System.Windows.Controls.TextBlock]::new()
         $percent.Text = ('{0:0.0}%' -f ([double]$item.sharePercent))
         $percent.Foreground = New-Brush '#9FFFFFFF'
-        $percent.FontSize = 9
+        $percent.FontSize = if ($stackedLayout) { 10 } else { 9 }
         $percent.HorizontalAlignment = 'Right'
         $percent.VerticalAlignment = 'Center'
         [System.Windows.Controls.Grid]::SetColumn($percent, 3)
+        if ($stackedLayout) { [System.Windows.Controls.Grid]::SetRow($percent, 0) }
 
         [void]$row.Children.Add($label)
         [void]$row.Children.Add($barHost)
@@ -1432,6 +1690,41 @@ function Get-DisplayDailyUsage {
     return [pscustomobject]@{ Rows = @($rows); Total = $total; Source = $source }
 }
 
+function Set-SkillView {
+    param([ValidateSet('primary', 'chain')][string]$Name)
+    $script:ActiveSkillView = $Name
+    $SkillPrimaryScroll.Visibility = if ($Name -eq 'primary') { 'Visible' } else { 'Collapsed' }
+    $SkillChainScroll.Visibility = if ($Name -eq 'chain') { 'Visible' } else { 'Collapsed' }
+
+    foreach ($entry in @(
+        [pscustomobject]@{ Name = 'primary'; Button = $SkillPrimaryButton },
+        [pscustomobject]@{ Name = 'chain'; Button = $SkillChainButton }
+    )) {
+        if ($entry.Name -eq $Name) {
+            $entry.Button.Background = New-Brush '#467ECDF7'
+            $entry.Button.BorderBrush = New-Brush '#70DDF5FF'
+            $entry.Button.Foreground = New-Brush '#F5FFFFFF'
+        } else {
+            $entry.Button.Background = New-Brush '#18FFFFFF'
+            $entry.Button.BorderBrush = New-Brush '#3CFFFFFF'
+            $entry.Button.Foreground = New-Brush '#BFFFFFFF'
+        }
+    }
+
+    if ($Name -eq 'chain') {
+        $SkillSectionTitle.Text = 'SKILL · 前后路由逻辑'
+        $SkillHintText.Text = '按证据顺序记录“路由器 → 执行 Skill”；每条链的 Token 只计一次。'
+    } elseif ($script:AnalyticsSnapshot) {
+        $SkillSectionTitle.Text = 'SKILL · 主归因 TOKEN'
+        $installedCount = [long]$script:AnalyticsSnapshot.installedSkillCount
+        $unattributed = [double]$script:AnalyticsSnapshot.unattributedSkillPercent
+        $SkillHintText.Text = ('已安装 {0} 个 · 未归因 {1:0.0}% · 关联 Token 不可相加。' -f $installedCount, $unattributed)
+    } else {
+        $SkillSectionTitle.Text = 'SKILL · 主归因 TOKEN'
+        $SkillHintText.Text = '主归因只计最终 Skill；关联 Token 不可相加。'
+    }
+}
+
 function Apply-AnalyticsSnapshot {
     param($Snapshot)
     if (-not $Snapshot) { return }
@@ -1445,10 +1738,14 @@ function Apply-AnalyticsSnapshot {
     Write-Diagnostic 'Rendered daily analytics rows.'
     Render-UsageRows -Panel $SkillRowsPanel -Rows @($Snapshot.skills) -Mode skill
     Write-Diagnostic 'Rendered skill analytics rows.'
+    Render-UsageRows -Panel $SkillChainRowsPanel -Rows @($Snapshot.skillChains) -Mode chain
+    Write-Diagnostic 'Rendered skill route chains.'
     Render-UsageRows -Panel $AgentRowsPanel -Rows @($Snapshot.agents) -Mode agent
     Write-Diagnostic 'Rendered agent analytics rows.'
 
-    $SkillCoverageText.Text = ('覆盖率 {0:0.0}%' -f ([double]$Snapshot.skillCoveragePercent))
+    $SkillPrimaryButton.Content = ('{0} Skill' -f ([long]$Snapshot.installedSkillCount))
+    $SkillCoverageText.Text = ('{0} Skills · 覆盖 {1:0.0}%' -f ([long]$Snapshot.installedSkillCount), ([double]$Snapshot.skillCoveragePercent))
+    Set-SkillView $script:ActiveSkillView
     $OfficialRateText.Text = if ($script:CurrentSnapshot) {
         '官方额度已用 {0:0}%' -f ([double]$script:CurrentSnapshot.UsedPercent)
     } else {
@@ -1476,6 +1773,7 @@ function Set-AnalyticsTab {
     $DailyPanel.Visibility = if ($Name -eq 'daily') { 'Visible' } else { 'Collapsed' }
     $SkillPanel.Visibility = if ($Name -eq 'skill') { 'Visible' } else { 'Collapsed' }
     $AgentPanel.Visibility = if ($Name -eq 'agent') { 'Visible' } else { 'Collapsed' }
+    if ($Name -eq 'skill') { Set-SkillView $script:ActiveSkillView }
 
     foreach ($entry in @(
         [pscustomobject]@{ Name = 'daily'; Button = $DailyTabButton },
@@ -1521,6 +1819,7 @@ function Show-OrbView {
     $script:ViewMode = 'orb'
     $GlowBorder.Visibility = 'Collapsed'
     $AnalyticsBorder.Visibility = 'Collapsed'
+    $ResetCreditsBorder.Visibility = 'Collapsed'
     $OrbView.Visibility = 'Visible'
     Resize-WindowAroundCenter -Width 88 -Height 88
     if ($script:CurrentSnapshot) {
@@ -1533,6 +1832,7 @@ function Show-AnalyticsView {
     $script:ViewMode = 'analytics'
     $OrbView.Visibility = 'Collapsed'
     $GlowBorder.Visibility = 'Collapsed'
+    $ResetCreditsBorder.Visibility = 'Collapsed'
     $AnalyticsBorder.Visibility = 'Visible'
     Resize-WindowAroundCenter -Width 440 -Height 560
     Set-AnalyticsTab $script:ActiveAnalyticsTab
@@ -1546,9 +1846,130 @@ function Show-CapacityView {
     $script:ViewMode = 'capacity'
     $OrbView.Visibility = 'Collapsed'
     $AnalyticsBorder.Visibility = 'Collapsed'
+    $ResetCreditsBorder.Visibility = 'Collapsed'
     $GlowBorder.Visibility = 'Visible'
-    Resize-WindowAroundCenter -Width 380 -Height 334
+    Resize-WindowAroundCenter -Width 380 -Height 362
     Update-ProgressFill
+}
+
+function Format-ResetCreditRemaining {
+    param([Parameter(Mandatory = $true)][DateTimeOffset]$ExpiresAt)
+
+    $remaining = $ExpiresAt - [DateTimeOffset]::Now
+    if ($remaining.TotalSeconds -le 0) { return '即将到期' }
+    if ($remaining.Days -gt 0) {
+        return ('剩余 {0} 天 {1} 小时' -f $remaining.Days, $remaining.Hours)
+    }
+    if ($remaining.Hours -gt 0) {
+        return ('剩余 {0} 小时 {1} 分钟' -f $remaining.Hours, $remaining.Minutes)
+    }
+    return ('剩余 {0} 分钟' -f [Math]::Max(1, $remaining.Minutes))
+}
+
+function Set-ResetCreditsState {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [string]$CountText = '—',
+        [switch]$CanRetry
+    )
+
+    $ResetCreditsCountText.Text = $CountText
+    $ResetCreditsRowsPanel.Children.Clear()
+    $ResetCreditsScroll.Visibility = 'Collapsed'
+    $ResetCreditsStateText.Text = $Message
+    $ResetCreditsStatePanel.Visibility = 'Visible'
+    $ResetCreditsRetryButton.Visibility = if ($CanRetry) { 'Visible' } else { 'Collapsed' }
+}
+
+function New-ResetCreditRow {
+    param(
+        [Parameter(Mandatory = $true)][int]$Index,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$ExpiresAt
+    )
+
+    $row = New-Object System.Windows.Controls.Border
+    $row.CornerRadius = New-Object System.Windows.CornerRadius(15)
+    $row.Background = New-Brush '#20FFFFFF'
+    $row.BorderBrush = New-Brush '#36FFFFFF'
+    $row.BorderThickness = New-Object System.Windows.Thickness(1)
+    $row.Padding = New-Object System.Windows.Thickness(14, 10, 14, 10)
+    $row.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+
+    $content = New-Object System.Windows.Controls.StackPanel
+    $title = New-Object System.Windows.Controls.TextBlock
+    $title.Text = ('重置卡 {0}' -f $Index)
+    $title.Foreground = New-Brush '#F5FFFFFF'
+    $title.FontSize = 12
+    $title.FontWeight = [System.Windows.FontWeights]::SemiBold
+
+    $localExpiry = $ExpiresAt.ToLocalTime()
+    $dateText = if ($localExpiry.Year -eq [DateTimeOffset]::Now.Year) {
+        '{0:MM月dd日 HH:mm}' -f $localExpiry.LocalDateTime
+    } else {
+        '{0:yyyy年MM月dd日 HH:mm}' -f $localExpiry.LocalDateTime
+    }
+    $detail = New-Object System.Windows.Controls.TextBlock
+    $detail.Text = ('{0} 到期 · {1}' -f $dateText, (Format-ResetCreditRemaining -ExpiresAt $localExpiry))
+    $detail.Foreground = New-Brush '#B8FFFFFF'
+    $detail.FontSize = 10.5
+    $detail.Margin = New-Object System.Windows.Thickness(0, 4, 0, 0)
+
+    [void]$content.Children.Add($title)
+    [void]$content.Children.Add($detail)
+    $row.Child = $content
+    return $row
+}
+
+function Apply-ResetCreditsSnapshot {
+    param([Parameter(Mandatory = $true)]$Snapshot)
+
+    $script:ResetCreditsSnapshot = $Snapshot
+    $availableCount = [Math]::Max(0, [int]$Snapshot.AvailableCount)
+    $credits = @($Snapshot.Credits | Sort-Object ExpiresAt)
+    $ResetCreditsCountText.Text = ('{0} 张' -f $availableCount)
+    $ResetCreditsRowsPanel.Children.Clear()
+
+    if ($availableCount -eq 0) {
+        Set-ResetCreditsState -Message '当前无可用重置卡' -CountText '0 张'
+        return
+    }
+
+    if ($credits.Count -eq 0) {
+        Set-ResetCreditsState -Message '已读取可用数量，但到期时间暂不可用' -CountText ('{0} 张' -f $availableCount) -CanRetry
+        return
+    }
+
+    for ($index = 0; $index -lt $credits.Count; $index++) {
+        [void]$ResetCreditsRowsPanel.Children.Add((New-ResetCreditRow -Index ($index + 1) -ExpiresAt ([DateTimeOffset]$credits[$index].ExpiresAt)))
+    }
+    $ResetCreditsStatePanel.Visibility = 'Collapsed'
+    $ResetCreditsScroll.Visibility = 'Visible'
+}
+
+function Show-ResetCreditsView {
+    $script:ViewMode = 'reset-credits'
+    $OrbView.Visibility = 'Collapsed'
+    $GlowBorder.Visibility = 'Collapsed'
+    $AnalyticsBorder.Visibility = 'Collapsed'
+    $ResetCreditsBorder.Visibility = 'Visible'
+    Resize-WindowAroundCenter -Width 400 -Height 430
+
+    if ($QARenderPath) {
+        $now = [DateTimeOffset]::Now
+        Apply-ResetCreditsSnapshot ([pscustomobject]@{
+            AvailableCount = 3
+            Credits = @(
+                [pscustomobject]@{ ExpiresAt = $now.AddDays(9).AddHours(3) },
+                [pscustomobject]@{ ExpiresAt = $now.AddDays(18).AddHours(7) },
+                [pscustomobject]@{ ExpiresAt = $now.AddDays(27).AddHours(12) }
+            )
+            ObservedAt = $now
+        })
+        return
+    }
+
+    Set-ResetCreditsState -Message '正在查询重置卡…' -CountText '查询中…'
+    Start-ResetCreditsRefreshAsync
 }
 
 function Start-DirectRefreshAsync {
@@ -1610,8 +2031,6 @@ function Complete-DirectRefreshIfReady {
                     ObservedAt    = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$rateWire.ObservedEpoch).ToLocalTime()
                 }
                 Apply-Snapshot $snapshot
-            } elseif ($script:CurrentSnapshot -and $script:CurrentSnapshot.Source -eq 'session') {
-                $HintText.Text = '账户接口未认证 · 当前显示事件快照'
             } elseif (-not $script:CurrentSnapshot) {
                 Apply-EmptyState '账户接口不可用；启动 Codex 完成响应后读取事件快照'
             }
@@ -1619,11 +2038,7 @@ function Complete-DirectRefreshIfReady {
                 Apply-AnalyticsSnapshot $script:AnalyticsSnapshot
             }
         } else {
-            if ($script:CurrentSnapshot -and $script:CurrentSnapshot.Source -eq 'session') {
-                $HintText.Text = '实时连接未完成 · 当前显示事件快照'
-            } elseif ($script:CurrentSnapshot) {
-                $HintText.Text = '实时刷新失败 · 保留上次快照'
-            } else {
+            if (-not $script:CurrentSnapshot) {
                 Apply-EmptyState '账户接口不可用；启动 Codex 完成响应后读取事件快照'
             }
             if ($errorText) {
@@ -1649,6 +2064,77 @@ function Complete-DirectRefreshIfReady {
     }
 }
 
+function Start-ResetCreditsRefreshAsync {
+    if ($script:ResetCreditsWorkerProcess -and -not $script:ResetCreditsWorkerProcess.HasExited) { return }
+
+    try {
+        if ($script:ResetCreditsWorkerProcess) {
+            $script:ResetCreditsWorkerProcess.Dispose()
+            $script:ResetCreditsWorkerProcess = $null
+        }
+
+        Set-ResetCreditsState -Message '正在查询重置卡…' -CountText '查询中…'
+        $workerInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $workerInfo.FileName = (Get-Command powershell.exe).Source
+        $workerInfo.Arguments = ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -ResetCreditsWorker' -f $script:ScriptPath)
+        $workerInfo.UseShellExecute = $false
+        $workerInfo.CreateNoWindow = $true
+        $workerInfo.RedirectStandardOutput = $true
+        $workerInfo.RedirectStandardError = $true
+
+        $worker = New-Object System.Diagnostics.Process
+        $worker.StartInfo = $workerInfo
+        [void]$worker.Start()
+        $script:ResetCreditsWorkerProcess = $worker
+        $script:IsResetCreditsRefreshing = $true
+        $ResetCreditsRefreshButton.IsEnabled = $false
+        $ResetCreditsRefreshButton.Content = '···'
+        $ResetCreditsRetryButton.IsEnabled = $false
+    } catch {
+        $script:IsResetCreditsRefreshing = $false
+        Set-ResetCreditsState -Message '暂时无法读取重置卡' -CanRetry
+        Write-Diagnostic 'Unable to start reset-credits worker.'
+    }
+}
+
+function Complete-ResetCreditsRefreshIfReady {
+    $worker = $script:ResetCreditsWorkerProcess
+    if (-not $worker -or -not $worker.HasExited) { return }
+
+    try {
+        $output = $worker.StandardOutput.ReadToEnd().Trim()
+        [void]$worker.StandardError.ReadToEnd()
+        if ($worker.ExitCode -ne 0 -or -not $output) {
+            throw 'RESET_CREDITS_QUERY_FAILED'
+        }
+
+        $wire = $output | ConvertFrom-Json
+        $credits = @($wire.Credits | ForEach-Object {
+            if ($null -ne $_.ExpiresEpoch) {
+                [pscustomobject]@{
+                    ExpiresAt = [DateTimeOffset]::FromUnixTimeSeconds([long]$_.ExpiresEpoch).ToLocalTime()
+                }
+            }
+        })
+        $snapshot = [pscustomobject]@{
+            AvailableCount = [int]$wire.AvailableCount
+            Credits        = $credits
+            ObservedAt     = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$wire.ObservedEpoch).ToLocalTime()
+        }
+        Apply-ResetCreditsSnapshot $snapshot
+    } catch {
+        Set-ResetCreditsState -Message '暂时无法读取重置卡' -CanRetry
+        Write-Diagnostic 'Reset-credits worker query failed.'
+    } finally {
+        $worker.Dispose()
+        $script:ResetCreditsWorkerProcess = $null
+        $script:IsResetCreditsRefreshing = $false
+        $ResetCreditsRefreshButton.Content = '↻'
+        $ResetCreditsRefreshButton.IsEnabled = $true
+        $ResetCreditsRetryButton.IsEnabled = $true
+    }
+}
+
 function Start-AnalyticsRefreshAsync {
     if ($script:IsAnalyticsRefreshing) { return }
     $script:IsAnalyticsRefreshing = $true
@@ -1668,6 +2154,11 @@ function Start-AnalyticsRefreshAsync {
             $arguments.Add([string]$codexHome)
         }
         if ($arguments.Count -le 1) { throw '未找到 Codex 本地目录。' }
+        $userSkillRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.agents\skills'
+        if (Test-Path -LiteralPath $userSkillRoot) {
+            $arguments.Add('--skill-root')
+            $arguments.Add($userSkillRoot)
+        }
         $arguments.Add('--cache')
         $arguments.Add($script:UsageCachePath)
         $arguments.Add('--rate-history')
@@ -1852,6 +2343,7 @@ $window.Add_MouseLeftButtonDown({
 $ProgressTrack.Add_SizeChanged({ Update-ProgressFill })
 
 $AnalyticsButton.Add_Click({ Show-AnalyticsView })
+$ResetCreditsButton.Add_Click({ Show-ResetCreditsView })
 $RefreshButton.Add_Click({
     Refresh-Data -TryDirect $false
     Start-DirectRefreshAsync
@@ -1905,6 +2397,16 @@ $AnalyticsCloseButton.Add_Click({
 $DailyTabButton.Add_Click({ Set-AnalyticsTab 'daily' })
 $SkillTabButton.Add_Click({ Set-AnalyticsTab 'skill' })
 $AgentTabButton.Add_Click({ Set-AnalyticsTab 'agent' })
+$SkillPrimaryButton.Add_Click({ Set-SkillView 'primary' })
+$SkillChainButton.Add_Click({ Set-SkillView 'chain' })
+$ResetCreditsBackButton.Add_Click({ Show-CapacityView })
+$ResetCreditsRefreshButton.Add_Click({ Start-ResetCreditsRefreshAsync })
+$ResetCreditsRetryButton.Add_Click({ Start-ResetCreditsRefreshAsync })
+$ResetCreditsHideButton.Add_Click({ Show-OrbView })
+$ResetCreditsCloseButton.Add_Click({
+    $script:ExitRequested = $true
+    $window.Close()
+})
 
 $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
 $countdownTimer.Interval = [TimeSpan]::FromSeconds(30)
@@ -1914,6 +2416,12 @@ $directWorkerTimer = New-Object System.Windows.Threading.DispatcherTimer
 $directWorkerTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 $directWorkerTimer.Add_Tick({
     Complete-DirectRefreshIfReady
+})
+
+$resetCreditsWorkerTimer = New-Object System.Windows.Threading.DispatcherTimer
+$resetCreditsWorkerTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$resetCreditsWorkerTimer.Add_Tick({
+    Complete-ResetCreditsRefreshIfReady
 })
 
 $eventTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1954,6 +2462,7 @@ $window.Add_Loaded({
     if (-not $QARenderPath) {
         $countdownTimer.Start()
         $directWorkerTimer.Start()
+        $resetCreditsWorkerTimer.Start()
         $eventTimer.Start()
     }
     # Started after the first layout pass below to avoid competing with startup rendering.
@@ -1969,7 +2478,10 @@ $window.Add_Loaded({
     $window.Dispatcher.BeginInvoke([Action]{
         if ($QARenderPath) {
             $qaPercentText = ('{0:0}%' -f $QARemaining)
-            $script:CurrentSnapshot = [pscustomobject]@{ Remaining = $QARemaining }
+            $script:CurrentSnapshot = [pscustomobject]@{
+                Remaining   = $QARemaining
+                UsedPercent = 100.0 - $QARemaining
+            }
             $PercentText.Text = $qaPercentText
             $OrbPercentText.Text = $qaPercentText
             $OrbPercentWaterText.Text = $qaPercentText
@@ -1987,6 +2499,12 @@ $window.Add_Loaded({
         switch ($QAView) {
             'orb' { Show-OrbView }
             'capacity' { Show-CapacityView }
+            'reset-credits' { Show-ResetCreditsView }
+            'skill-chain' {
+                $script:ActiveAnalyticsTab = 'skill'
+                $script:ActiveSkillView = 'chain'
+                Show-AnalyticsView
+            }
             default {
                 $script:ActiveAnalyticsTab = $QAView
                 Show-AnalyticsView
@@ -2038,10 +2556,13 @@ $window.Add_Closing({
     Save-WindowPosition
     $countdownTimer.Stop()
     $directWorkerTimer.Stop()
+    $resetCreditsWorkerTimer.Stop()
     $eventTimer.Stop()
     $waveTimer.Stop()
     Stop-OwnedProcess $script:DirectWorkerProcess
     $script:DirectWorkerProcess = $null
+    Stop-OwnedProcess $script:ResetCreditsWorkerProcess
+    $script:ResetCreditsWorkerProcess = $null
     $notifyIcon.Visible = $false
     $notifyIcon.Dispose()
 })
