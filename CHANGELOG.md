@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0 - 2026-07-23
+
+- Added an optional Gradient orb style with six continuously interpolated quota anchors from blue at 100% to orange at 0%.
+- Added adaptive two-layer number contrast and a synchronized 600 ms water/color transition for the Gradient style.
+- Preserved the original non-gradient Classic style as the default.
+- Added `-OrbStyle Classic|Gradient` installation and launch selection.
+- Added separate Classic and Gradient GitHub release packages without changing the existing v1.2.0 release.
+- Added standalone Codex executable discovery alongside the existing npm layout detection.
+
 ## 1.2.0 - 2026-07-22
 
 - Added a read-only Reset Credits page showing the available count and each local expiry time.

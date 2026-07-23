@@ -15,6 +15,25 @@ Codex Quota Orb is a lightweight, local-first Windows widget. Its liquid orb sho
 > [!NOTE]
 > Community project. Not affiliated with or endorsed by OpenAI. Codex interfaces can change, so a future Codex update may require a widget update.
 
+## Latest update
+
+| Updated | Version | Categories |
+| --- | --- | --- |
+| 2026-07-23 | 1.3.0 | Appearance · Codex compatibility · Distribution |
+
+- **Appearance:** added an optional six-stage blue-to-orange quota gradient with adaptive number contrast.
+- **Codex compatibility:** recognizes both standalone Codex executables and npm-installed layouts.
+- **Distribution:** keeps the original Classic style as the default and publishes separate Classic and Gradient packages.
+
+## Choose your orb style
+
+| Classic — original | Gradient — new |
+| --- | --- |
+| <img src="assets/orb-classic.png" alt="Classic non-gradient orb" width="112"> | <img src="assets/orb-gradient.png" alt="Blue-to-orange gradient orb" width="112"> |
+| The familiar non-gradient liquid orb from earlier releases. It remains the default. | Changes continuously through six anchors: blue, sky blue, teal, gold, amber, and orange. Exposed numbers adapt for contrast. |
+
+Both styles have the same quota, Reset Credits, analytics, privacy, and tray features. Re-run either explicit install command at any time to switch styles without removing usage history. Later default updates preserve the style you already selected.
+
 ## Highlights
 
 - Live weekly quota from the local Codex app server, with session-event fallback.
@@ -39,7 +58,7 @@ Codex Quota Orb is a lightweight, local-first Windows widget. Its liquid orb sho
 
 ## Install
 
-### One command
+### Classic style — original and default
 
 Open PowerShell and run:
 
@@ -47,9 +66,23 @@ Open PowerShell and run:
 irm https://raw.githubusercontent.com/CW12138/codex-quota-orb/main/Install.ps1 | iex
 ```
 
+You can also select it explicitly:
+
+```powershell
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/CW12138/codex-quota-orb/main/Install.ps1'))) -OrbStyle Classic
+```
+
+### Gradient style — blue to orange
+
+```powershell
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/CW12138/codex-quota-orb/main/Install.ps1'))) -OrbStyle Gradient
+```
+
 The installer downloads this repository, copies the runtime files to `%LOCALAPPDATA%\Programs\CodexQuotaOrb`, adds a Start Menu shortcut, enables launch detection for interactive `codex` sessions, and starts the widget. It does not require administrator rights.
 
 Prefer to inspect scripts before running them? Download or clone the repository, review `Install.ps1`, and then double-click `Install.cmd`.
+
+GitHub Releases also provides two portable packages: `Classic.zip` and `Gradient.zip`. The previous `v1.2.0` release and its original package remain unchanged.
 
 ### Requirements
 
@@ -70,7 +103,8 @@ Prefer to inspect scripts before running them? Download or clone the repository,
 To start it manually, open **Codex Quota Orb** from the Start Menu or run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexRateWidget.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexRateWidget.ps1 -OrbStyle Classic
+powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexRateWidget.ps1 -OrbStyle Gradient
 ```
 
 ## What the numbers mean
@@ -124,6 +158,9 @@ python -m py_compile .\UsageAnalytics.py
 
 Codex Quota Orb 是一个 Windows 原生、本地优先的 Codex 额度悬浮窗。水球显示周额度剩余百分比，点击后可查看额度详情、重置卡余量与到期时间、近 7 日 Token，以及本机 Skill/Agent 归因统计。
 
+- **2026-07-23 更新（v1.3.0）：** 新增可选的蓝色到橙色六段渐变主题、适配新版独立 Codex 可执行文件，并分别提供经典版与渐变版发布包。
+- **经典版：** 保留此前的非渐变水球并继续作为默认选择。
+- **渐变版：** 额度从 100% 到 0% 依次经过蓝、天蓝、青绿、金、琥珀、橙色；低额度时露出区域的数字自动改用深灰蓝色。
 - 一行命令安装，无需管理员权限。
 - 主额度页不依赖 Python；统计页需要 Python 3.10+。
 - 不上传会话内容，不保存、显示或记录访问令牌，不调用模型生成。

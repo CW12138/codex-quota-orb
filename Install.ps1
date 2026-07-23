@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$InstallDirectory = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\CodexQuotaOrb'),
+    [ValidateSet('Auto', 'Classic', 'Gradient')][string]$OrbStyle = 'Auto',
     [switch]$NoAutoStart,
     [switch]$NoShortcuts,
     [switch]$NoLaunch
@@ -95,6 +96,21 @@ try {
     }
 
     $resolvedInstallDirectory = [System.IO.Path]::GetFullPath($InstallDirectory)
+    $resolvedOrbStyle = $OrbStyle
+    if ($resolvedOrbStyle -eq 'Auto') {
+        $sourceStylePath = Join-Path $sourceDirectory 'orb-style.txt'
+        $installedStylePath = Join-Path $resolvedInstallDirectory 'orb-style.txt'
+        if (Test-Path -LiteralPath $sourceStylePath -PathType Leaf) {
+            $sourceStyle = (Get-Content -LiteralPath $sourceStylePath -Encoding UTF8 -Raw).Trim()
+            $resolvedOrbStyle = if ($sourceStyle -in @('Classic', 'Gradient')) { $sourceStyle } else { 'Classic' }
+        } elseif (Test-Path -LiteralPath $installedStylePath -PathType Leaf) {
+            $installedStyle = (Get-Content -LiteralPath $installedStylePath -Encoding UTF8 -Raw).Trim()
+            $resolvedOrbStyle = if ($installedStyle -in @('Classic', 'Gradient')) { $installedStyle } else { 'Classic' }
+        } else {
+            $resolvedOrbStyle = 'Classic'
+        }
+    }
+
     Stop-InstalledProcesses -Directory $resolvedInstallDirectory
     New-Item -ItemType Directory -Path $resolvedInstallDirectory -Force | Out-Null
 
@@ -105,6 +121,7 @@ try {
             Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
         }
     }
+    Set-Content -LiteralPath (Join-Path $resolvedInstallDirectory 'orb-style.txt') -Value $resolvedOrbStyle -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $resolvedInstallDirectory '.installed') -Value 'CodexQuotaOrb' -Encoding ASCII
 
     $wscriptPath = (Get-Command wscript.exe).Source
@@ -134,6 +151,7 @@ try {
     Write-Host ''
     Write-Host 'Codex Quota Orb is installed.' -ForegroundColor Green
     Write-Host "Location: $resolvedInstallDirectory"
+    Write-Host "Orb style: $resolvedOrbStyle"
     Write-Host 'Open it any time from the Start Menu.'
     if (-not (Get-Command python.exe -ErrorAction SilentlyContinue) -and -not (Get-Command python -ErrorAction SilentlyContinue)) {
         Write-Warning 'Python was not found. The quota orb works, but local analytics requires Python 3.10+ on PATH.'

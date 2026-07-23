@@ -35,18 +35,25 @@ jobs:
             'LICENSE',
             'VERSION'
           )
-          New-Item -ItemType Directory -Path dist\CodexQuotaOrb | Out-Null
-          Copy-Item -LiteralPath $packageFiles -Destination dist\CodexQuotaOrb
-          Compress-Archive -Path dist\CodexQuotaOrb -DestinationPath "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME.zip"
-          $hash = (Get-FileHash "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  CodexQuotaOrb-$env:GITHUB_REF_NAME.zip" | Set-Content dist\SHA256SUMS.txt -Encoding ascii
+          $hashLines = foreach ($style in @('Classic', 'Gradient')) {
+            $packageDirectory = "dist\CodexQuotaOrb-$style"
+            $archivePath = "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME-$style.zip"
+            New-Item -ItemType Directory -Path $packageDirectory | Out-Null
+            Copy-Item -LiteralPath $packageFiles -Destination $packageDirectory
+            Set-Content -LiteralPath (Join-Path $packageDirectory 'orb-style.txt') -Value $style -Encoding ascii
+            Compress-Archive -Path $packageDirectory -DestinationPath $archivePath
+            $hash = (Get-FileHash $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path -Leaf $archivePath)"
+          }
+          $hashLines | Set-Content dist\SHA256SUMS.txt -Encoding ascii
       - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create $env:GITHUB_REF_NAME `
-            "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME.zip" `
+            "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME-Classic.zip" `
+            "dist\CodexQuotaOrb-$env:GITHUB_REF_NAME-Gradient.zip" `
             "dist\SHA256SUMS.txt" `
             --title "Codex Quota Orb $env:GITHUB_REF_NAME" `
             --generate-notes

@@ -7,6 +7,7 @@
     [string]$QARenderPath,
     [ValidateRange(0, 100)][double]$QARemaining = 64.0,
     [ValidateSet('orb', 'capacity', 'daily', 'skill', 'skill-chain', 'agent', 'reset-credits')][string]$QAView = 'orb',
+    [ValidateSet('Auto', 'Classic', 'Gradient')][string]$OrbStyle = 'Auto',
     [int]$AutoCloseSeconds = 0
 )
 
@@ -48,6 +49,16 @@ $script:CodexHome = if ($env:CODEX_HOME) {
 }
 $script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ScriptPath = $MyInvocation.MyCommand.Path
+$script:OrbStyle = $OrbStyle
+if ($script:OrbStyle -eq 'Auto') {
+    $orbStylePath = Join-Path $script:ScriptDir 'orb-style.txt'
+    if (Test-Path -LiteralPath $orbStylePath -PathType Leaf) {
+        $savedOrbStyle = (Get-Content -LiteralPath $orbStylePath -Encoding UTF8 -Raw).Trim()
+        $script:OrbStyle = if ($savedOrbStyle -in @('Classic', 'Gradient')) { $savedOrbStyle } else { 'Classic' }
+    } else {
+        $script:OrbStyle = 'Classic'
+    }
+}
 $script:RuntimeDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CodexRateWidget'
 $script:CurrentSnapshot = $null
 $script:LastRolloutPath = $null
@@ -67,9 +78,22 @@ $script:ActiveSkillView = 'primary'
 $script:LastRateHistorySignature = $null
 $script:ViewMode = 'orb'
 $script:OrbWaterLevel = 0.0
+$script:OrbWaterTarget = 0.0
+$script:OrbWaterTransitionFrom = 0.0
+$script:OrbWaterTransitionStartedAt = [DateTime]::UtcNow
+$script:OrbWaterTransitionDurationMs = 600.0
+$script:OrbWaterTransitionActive = $false
 $script:WavePhase = 0.0
 $script:OrbIsDragging = $false
 $script:OrbPointerMoved = $false
+$script:OrbThemeAnchors = @(
+    [pscustomobject]@{ Remaining = 0.0;   Color = '#FFF0642F' }
+    [pscustomobject]@{ Remaining = 20.0;  Color = '#FFE58B2F' }
+    [pscustomobject]@{ Remaining = 40.0;  Color = '#FFD0A43A' }
+    [pscustomobject]@{ Remaining = 60.0;  Color = '#FF31A58F' }
+    [pscustomobject]@{ Remaining = 80.0;  Color = '#FF3EA5DA' }
+    [pscustomobject]@{ Remaining = 100.0; Color = '#FF2F75D6' }
+)
 
 try {
     if (-not (Test-Path -LiteralPath $script:RuntimeDir)) {
@@ -95,15 +119,21 @@ function Write-Diagnostic {
 
 function Find-CodexExecutable {
     $candidates = New-Object System.Collections.Generic.List[string]
-    $command = Get-Command codex -ErrorAction SilentlyContinue
+    $command = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue
     if ($command -and $command.Source) {
+        if ([IO.Path]::GetExtension([string]$command.Source) -ieq '.exe') {
+            $candidates.Add([string]$command.Source)
+        }
+
         $npmRoot = Split-Path -Parent $command.Source
         $candidates.Add((Join-Path $npmRoot 'node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'))
         $candidates.Add((Join-Path $npmRoot 'node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'))
     }
 
+    $candidates.Add((Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\OpenAI\Codex\bin\codex.exe'))
+
     foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
             return $candidate
         }
     }
@@ -709,7 +739,7 @@ if ($HeadlessProbe) {
                             <GradientStop Color="#28FFFFFF" Offset="1"/>
                         </RadialGradientBrush>
                     </Canvas.OpacityMask>
-                    <Rectangle Width="100" Height="100">
+                    <Rectangle x:Name="OrbAtmosphereFill" Width="100" Height="100">
                         <Rectangle.Fill>
                             <RadialGradientBrush Center="0.42,0.3" GradientOrigin="0.31,0.18" RadiusX="0.72" RadiusY="0.72">
                                 <GradientStop Color="#52FFFFFF" Offset="0"/>
@@ -757,7 +787,7 @@ if ($HeadlessProbe) {
                             </LinearGradientBrush>
                         </Path.Fill>
                     </Path>
-                    <Path Canvas.Top="40" Fill="Transparent" Stroke="#76020A13" StrokeThickness="3.1" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Opacity="0.48"
+                    <Path x:Name="OrbWaveShade" Canvas.Top="40" Fill="Transparent" Stroke="#76020A13" StrokeThickness="3.1" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Opacity="0.48"
                           Data="M -90,10 C -70,20 -50,20 -30,10 C -10,0 10,0 30,10 C 50,20 70,20 90,10 C 110,0 130,0 150,10 C 170,20 190,20 210,10 C 230,0 250,0 270,10"/>
                     <Path x:Name="OrbWaveFront" Canvas.Top="38" Stroke="#9CCAE3EC" StrokeThickness="1.45" Opacity="0.86"
                           Data="M -90,10 C -70,20 -50,20 -30,10 C -10,0 10,0 30,10 C 50,20 70,20 90,10 C 110,0 130,0 150,10 C 170,20 190,20 210,10 C 230,0 250,0 270,10 L 270,116 L -90,116 Z">
@@ -1239,10 +1269,12 @@ $OrbSurface = $window.FindName('OrbSurface')
 $OrbHitTarget = $window.FindName('OrbHitTarget')
 $OrbRippleOuter = $window.FindName('OrbRippleOuter')
 $OrbWaterCanvas = $window.FindName('OrbWaterCanvas')
+$OrbAtmosphereFill = $window.FindName('OrbAtmosphereFill')
 $OrbWaterFill = $window.FindName('OrbWaterFill')
 $OrbWaterGloss = $window.FindName('OrbWaterGloss')
 $OrbWaterSheen = $window.FindName('OrbWaterSheen')
 $OrbWaveBack = $window.FindName('OrbWaveBack')
+$OrbWaveShade = $window.FindName('OrbWaveShade')
 $OrbWaveFront = $window.FindName('OrbWaveFront')
 $OrbWaveGlint = $window.FindName('OrbWaveGlint')
 $OrbPercentText = $window.FindName('OrbPercentText')
@@ -1309,6 +1341,117 @@ function New-Brush {
     return [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString($Color))
 }
 
+function ConvertTo-OrbColor {
+    param([string]$Color)
+    return [System.Windows.Media.ColorConverter]::ConvertFromString($Color)
+}
+
+function Mix-OrbColor {
+    param(
+        [System.Windows.Media.Color]$From,
+        [System.Windows.Media.Color]$To,
+        [double]$Amount,
+        [byte]$Alpha = 255
+    )
+
+    $mix = [Math]::Max(0.0, [Math]::Min(1.0, $Amount))
+    $red = [byte][Math]::Round($From.R + (($To.R - $From.R) * $mix))
+    $green = [byte][Math]::Round($From.G + (($To.G - $From.G) * $mix))
+    $blue = [byte][Math]::Round($From.B + (($To.B - $From.B) * $mix))
+    return [System.Windows.Media.Color]::FromArgb($Alpha, $red, $green, $blue)
+}
+
+function Get-OrbThemeColor {
+    param([double]$Remaining)
+
+    $level = [Math]::Max(0.0, [Math]::Min(100.0, $Remaining))
+    for ($index = 0; $index -lt ($script:OrbThemeAnchors.Count - 1); $index++) {
+        $lower = $script:OrbThemeAnchors[$index]
+        $upper = $script:OrbThemeAnchors[$index + 1]
+        if ($level -le [double]$upper.Remaining) {
+            $span = [double]$upper.Remaining - [double]$lower.Remaining
+            $amount = if ($span -gt 0) { ($level - [double]$lower.Remaining) / $span } else { 0.0 }
+            return Mix-OrbColor (ConvertTo-OrbColor $lower.Color) (ConvertTo-OrbColor $upper.Color) $amount
+        }
+    }
+
+    return ConvertTo-OrbColor $script:OrbThemeAnchors[-1].Color
+}
+
+function Set-OrbTheme {
+    param([double]$Remaining)
+
+    $theme = Get-OrbThemeColor $Remaining
+    $white = [System.Windows.Media.Colors]::White
+    $black = [System.Windows.Media.Colors]::Black
+
+    $atmosphereStops = $OrbAtmosphereFill.Fill.GradientStops
+    $atmosphereStops[0].Color = Mix-OrbColor $theme $white 0.50 136
+    $atmosphereStops[1].Color = Mix-OrbColor $theme $white 0.16 168
+    $atmosphereStops[2].Color = Mix-OrbColor $theme $black 0.26 184
+
+    $waterStops = $OrbWaterFill.Fill.GradientStops
+    $waterStops[0].Color = Mix-OrbColor $theme $white 0.42 176
+    $waterStops[1].Color = Mix-OrbColor $theme $white 0.08 207
+    $waterStops[2].Color = Mix-OrbColor $theme $black 0.34 229
+    $waterStops[3].Color = Mix-OrbColor $theme $black 0.57 240
+
+    $glossStops = $OrbWaterGloss.Fill.GradientStops
+    $glossStops[0].Color = Mix-OrbColor $theme $white 0.72 112
+    $glossStops[1].Color = Mix-OrbColor $theme $white 0.24 64
+    $glossStops[2].Color = Mix-OrbColor $theme $black 0.20 36
+    $glossStops[3].Color = Mix-OrbColor $theme $black 0.52 0
+
+    $sheenStops = $OrbWaterSheen.Fill.GradientStops
+    $sheenStops[0].Color = Mix-OrbColor $theme $white 0.64 56
+    $sheenStops[1].Color = Mix-OrbColor $theme $white 0.08 36
+    $sheenStops[2].Color = Mix-OrbColor $theme $black 0.48 72
+
+    $OrbWaveBack.Stroke.Color = Mix-OrbColor $theme $white 0.52 120
+    $backStops = $OrbWaveBack.Fill.GradientStops
+    $backStops[0].Color = Mix-OrbColor $theme $white 0.22 94
+    $backStops[1].Color = Mix-OrbColor $theme $black 0.18 72
+    $backStops[2].Color = Mix-OrbColor $theme $black 0.58 36
+
+    $OrbWaveShade.Stroke.Color = Mix-OrbColor $theme $black 0.72 118
+
+    $OrbWaveFront.Stroke.Color = Mix-OrbColor $theme $white 0.64 172
+    $frontStops = $OrbWaveFront.Fill.GradientStops
+    $frontStops[0].Color = Mix-OrbColor $theme $white 0.28 112
+    $frontStops[1].Color = Mix-OrbColor $theme $black 0.12 106
+    $frontStops[2].Color = Mix-OrbColor $theme $black 0.54 54
+
+    if ($Remaining -ge 52.0) {
+        $OrbPercentText.Foreground.Color = [System.Windows.Media.Colors]::White
+        $OrbPercentText.Effect.Color = ConvertTo-OrbColor '#FF071529'
+        $OrbPercentText.Effect.Opacity = 0.9
+    } else {
+        $OrbPercentText.Foreground.Color = ConvertTo-OrbColor '#FF263746'
+        $OrbPercentText.Effect.Color = ConvertTo-OrbColor '#F2FFFFFF'
+        $OrbPercentText.Effect.Opacity = 0.82
+    }
+}
+
+function Set-OrbWaterGeometry {
+    param([double]$Remaining)
+
+    $level = [Math]::Max(0.0, [Math]::Min(100.0, $Remaining))
+    $waterLine = 96.0 - (0.92 * $level)
+    $bodyTop = [Math]::Min(100.0, $waterLine + 5.0)
+    [System.Windows.Controls.Canvas]::SetTop($OrbWaterFill, $bodyTop)
+    $OrbWaterFill.Height = [Math]::Max(0.0, 104.0 - $bodyTop)
+    [System.Windows.Controls.Canvas]::SetTop($OrbWaterGloss, $bodyTop)
+    $OrbWaterGloss.Height = [Math]::Max(0.0, 104.0 - $bodyTop)
+    [System.Windows.Controls.Canvas]::SetTop($OrbWaterSheen, $bodyTop)
+    $OrbWaterSheen.Height = [Math]::Max(0.0, 104.0 - $bodyTop)
+
+    $OrbPercentClipTranslate.X = -$script:WavePhase * 0.76
+    $OrbPercentClipTranslate.Y = ($waterLine - 10.0) * 0.76
+    if ($script:OrbStyle -eq 'Gradient') {
+        Set-OrbTheme $level
+    }
+}
+
 function Update-Countdown {
     if (-not $script:CurrentSnapshot -or -not $script:CurrentSnapshot.ResetAt) {
         $ResetText.Text = '重置时间暂不可用'
@@ -1343,26 +1486,51 @@ function Update-ProgressFill {
 }
 
 function Update-OrbWaterLevel {
-    param([double]$Remaining)
+    param(
+        [double]$Remaining,
+        [switch]$Immediate
+    )
 
-    $script:OrbWaterLevel = [Math]::Max(0.0, [Math]::Min(100.0, $Remaining))
-    $waterLine = 96.0 - (0.92 * $script:OrbWaterLevel)
-    $bodyTop = [Math]::Min(100.0, $waterLine + 5.0)
-    [System.Windows.Controls.Canvas]::SetTop($OrbWaterFill, $bodyTop)
-    $OrbWaterFill.Height = [Math]::Max(0.0, 104.0 - $bodyTop)
-    [System.Windows.Controls.Canvas]::SetTop($OrbWaterGloss, $bodyTop)
-    $OrbWaterGloss.Height = [Math]::Max(0.0, 104.0 - $bodyTop)
-    [System.Windows.Controls.Canvas]::SetTop($OrbWaterSheen, $bodyTop)
-    $OrbWaterSheen.Height = [Math]::Max(0.0, 104.0 - $bodyTop)
+    $target = [Math]::Max(0.0, [Math]::Min(100.0, $Remaining))
+    if ($Immediate -or $script:OrbStyle -eq 'Classic') {
+        $script:OrbWaterLevel = $target
+        $script:OrbWaterTarget = $target
+        $script:OrbWaterTransitionActive = $false
+        Set-OrbWaterGeometry $script:OrbWaterLevel
+        return
+    }
 
-    $OrbPercentClipTranslate.X = -$script:WavePhase * 0.76
-    $OrbPercentClipTranslate.Y = ($waterLine - 10.0) * 0.76
+    if ($script:OrbWaterTransitionActive -and [Math]::Abs($script:OrbWaterTarget - $target) -lt 0.01) {
+        return
+    }
+    if (-not $script:OrbWaterTransitionActive -and [Math]::Abs($script:OrbWaterLevel - $target) -lt 0.01) {
+        Set-OrbWaterGeometry $script:OrbWaterLevel
+        return
+    }
+
+    $script:OrbWaterTransitionFrom = $script:OrbWaterLevel
+    $script:OrbWaterTarget = $target
+    $script:OrbWaterTransitionStartedAt = [DateTime]::UtcNow
+    $script:OrbWaterTransitionActive = $true
 }
 
 function Update-OrbAnimationFrame {
     if ($OrbView.Visibility -ne [System.Windows.Visibility]::Visible) { return }
 
-    $script:WavePhase = ($script:WavePhase + 1.8) % 80.0
+    if ($script:OrbStyle -eq 'Gradient' -and $script:OrbWaterTransitionActive) {
+        $elapsed = ([DateTime]::UtcNow - $script:OrbWaterTransitionStartedAt).TotalMilliseconds
+        $progress = [Math]::Max(0.0, [Math]::Min(1.0, $elapsed / $script:OrbWaterTransitionDurationMs))
+        $eased = 1.0 - [Math]::Pow(1.0 - $progress, 3.0)
+        $script:OrbWaterLevel = $script:OrbWaterTransitionFrom + (($script:OrbWaterTarget - $script:OrbWaterTransitionFrom) * $eased)
+        if ($progress -ge 1.0) {
+            $script:OrbWaterLevel = $script:OrbWaterTarget
+            $script:OrbWaterTransitionActive = $false
+        }
+        Set-OrbWaterGeometry $script:OrbWaterLevel
+    }
+
+    $phaseStep = if ($script:OrbStyle -eq 'Gradient') { 0.56 } else { 1.8 }
+    $script:WavePhase = ($script:WavePhase + $phaseStep) % 80.0
     $waterLine = 96.0 - (0.92 * $script:OrbWaterLevel)
     $frontBob = [Math]::Sin($script:WavePhase * [Math]::PI / 40.0) * 1.3
     $backBob = [Math]::Cos($script:WavePhase * [Math]::PI / 40.0) * 1.0
@@ -2446,7 +2614,11 @@ $eventTimer.Add_Tick({
 })
 
 $waveTimer = New-Object System.Windows.Threading.DispatcherTimer
-$waveTimer.Interval = [TimeSpan]::FromMilliseconds(160)
+$waveTimer.Interval = if ($script:OrbStyle -eq 'Gradient') {
+    [TimeSpan]::FromMilliseconds(50)
+} else {
+    [TimeSpan]::FromMilliseconds(160)
+}
 $waveTimer.Add_Tick({ Update-OrbAnimationFrame })
 
 $window.Add_StateChanged({
@@ -2490,7 +2662,7 @@ $window.Add_Loaded({
             $UpdatedText.Text = '12:48:16'
             $SevenDayTotalText.Text = '1.28M'
             $OfficialRateText.Text = ('官方额度 {0}' -f $qaPercentText)
-            Update-OrbWaterLevel $QARemaining
+            Update-OrbWaterLevel $QARemaining -Immediate
             Update-ProgressFill
         } else {
             Refresh-Data -TryDirect $false
