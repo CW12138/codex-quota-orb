@@ -3,6 +3,7 @@ Set-StrictMode -Version 2.0
 
 $root = Split-Path -Parent $PSScriptRoot
 $installer = Get-Content -LiteralPath (Join-Path $root 'Install.ps1') -Encoding UTF8 -Raw
+$widget = Get-Content -LiteralPath (Join-Path $root 'CodexRateWidget.ps1') -Encoding UTF8 -Raw
 $releaseWorkflow = Get-Content -LiteralPath (Join-Path $root '.github\workflows\release.yml') -Encoding UTF8 -Raw
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Encoding UTF8 -Raw
 
@@ -24,6 +25,19 @@ foreach ($fragment in @(
 )) {
     if (-not $releaseWorkflow.Contains($fragment)) {
         throw ('Missing dual-style release contract fragment: ' + $fragment)
+    }
+}
+
+foreach ($fragment in @(
+    'x:Name="OrbStyleToggleButton"',
+    'x:Name="ClassicStyleDot"',
+    'x:Name="GradientStyleDot"',
+    'function Set-OrbStyleMode',
+    'function Restore-ClassicOrbTheme',
+    "Set-Content -LiteralPath (Join-Path `$script:ScriptDir 'orb-style.txt')"
+)) {
+    if (-not $widget.Contains($fragment)) {
+        throw ('Missing in-app style-toggle contract fragment: ' + $fragment)
     }
 }
 

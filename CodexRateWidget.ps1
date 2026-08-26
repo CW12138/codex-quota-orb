@@ -3,10 +3,13 @@
     [switch]$HeadlessProbe,
     [switch]$DirectWorker,
     [switch]$ResetCreditsWorker,
+    [switch]$AnalyticsWorker,
     [switch]$QASolidWindow,
     [string]$QARenderPath,
+    [string]$QATrayIconPath,
     [ValidateRange(0, 100)][double]$QARemaining = 64.0,
-    [ValidateSet('orb', 'capacity', 'daily', 'skill', 'skill-chain', 'agent', 'reset-credits')][string]$QAView = 'orb',
+    [switch]$QAFiveHourAvailable,
+    [ValidateSet('orb', 'capacity', 'daily', 'skill', 'skill-chain', 'agent', 'tool', 'reset-credits')][string]$QAView = 'orb',
     [ValidateSet('Auto', 'Classic', 'Gradient')][string]$OrbStyle = 'Auto',
     [int]$AutoCloseSeconds = 0
 )
@@ -21,8 +24,21 @@ Add-Type -AssemblyName System.Xaml
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+if (-not ('CodexQuotaOrb.TrayNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace CodexQuotaOrb {
+    public static class TrayNative {
+        [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr handle);
+    }
+}
+'@
+}
+
 $mutex = $null
-if (-not $HeadlessProbe -and -not $DirectWorker -and -not $ResetCreditsWorker -and -not $QARenderPath) {
+if (-not $HeadlessProbe -and -not $DirectWorker -and -not $ResetCreditsWorker -and -not $AnalyticsWorker -and -not $QARenderPath -and -not $QATrayIconPath) {
     $createdNew = $false
     $mutex = New-Object System.Threading.Mutex($true, 'Local\CodexRateLimitWidget', [ref]$createdNew)
     if (-not $createdNew) {
@@ -61,15 +77,25 @@ if ($script:OrbStyle -eq 'Auto') {
 }
 $script:RuntimeDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CodexRateWidget'
 $script:CurrentSnapshot = $null
+$script:FiveHourSnapshot = $null
+$script:WeeklySnapshot = $null
+$script:FiveHourUsesWeeklyFallback = $true
 $script:LastRolloutPath = $null
 $script:LastRolloutWriteTicks = 0L
 $script:ExitRequested = $false
 $script:IsRefreshing = $false
 $script:DirectWorkerProcess = $null
+$script:DirectWorkerStartedAt = $null
+$script:DirectWorkerOutputTask = $null
+$script:DirectWorkerErrorTask = $null
 $script:PendingDirectRefresh = $false
 $script:ResetCreditsWorkerProcess = $null
 $script:IsResetCreditsRefreshing = $false
 $script:ResetCreditsSnapshot = $null
+$script:AnalyticsWorkerProcess = $null
+$script:AnalyticsWorkerStartedAt = $null
+$script:AnalyticsWorkerOutputTask = $null
+$script:AnalyticsWorkerErrorTask = $null
 $script:IsAnalyticsRefreshing = $false
 $script:AnalyticsSnapshot = $null
 $script:AccountUsage = $null
@@ -86,6 +112,7 @@ $script:OrbWaterTransitionActive = $false
 $script:WavePhase = 0.0
 $script:OrbIsDragging = $false
 $script:OrbPointerMoved = $false
+$script:TrayIconResource = $null
 $script:OrbThemeAnchors = @(
     [pscustomobject]@{ Remaining = 0.0;   Color = '#FFF0642F' }
     [pscustomobject]@{ Remaining = 20.0;  Color = '#FFE58B2F' }
@@ -115,6 +142,146 @@ function Write-Diagnostic {
     if ($ShowDiagnostics) {
         Write-Host ('[{0:HH:mm:ss}] {1}' -f (Get-Date), $Message)
     }
+}
+
+function New-QuotaTrayBitmap {
+    param(
+        [ValidateRange(16, 512)]
+        [int]$Size = 32
+    )
+
+    $bitmap = [System.Drawing.Bitmap]::new(
+        $Size,
+        $Size,
+        [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+    )
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $resources = New-Object System.Collections.Generic.List[System.IDisposable]
+    try {
+        $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+        $graphics.Clear([System.Drawing.Color]::Transparent)
+        $scale = [single]($Size / 32.0)
+        $graphics.ScaleTransform($scale, $scale)
+
+        $outerRect = [System.Drawing.RectangleF]::new(1.5, 1.5, 29.0, 29.0)
+        $innerRect = [System.Drawing.RectangleF]::new(4.0, 4.0, 24.0, 24.0)
+        $outerBrush = [System.Drawing.SolidBrush]::new(
+            [System.Drawing.Color]::FromArgb(255, 7, 30, 61)
+        )
+        $resources.Add($outerBrush)
+        $graphics.FillEllipse($outerBrush, $outerRect)
+
+        $atmosphereBrush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+            $innerRect,
+            [System.Drawing.Color]::FromArgb(255, 218, 247, 255),
+            [System.Drawing.Color]::FromArgb(255, 95, 157, 198),
+            [System.Drawing.Drawing2D.LinearGradientMode]::Vertical
+        )
+        $resources.Add($atmosphereBrush)
+        $graphics.FillEllipse($atmosphereBrush, $innerRect)
+
+        $clipPath = [System.Drawing.Drawing2D.GraphicsPath]::new()
+        $resources.Add($clipPath)
+        $clipPath.AddEllipse($innerRect)
+        $graphics.SetClip($clipPath)
+
+        # A deliberately fixed half-full waterline stays legible in the 16 px tray.
+        $waterPath = [System.Drawing.Drawing2D.GraphicsPath]::new()
+        $resources.Add($waterPath)
+        $waterPath.StartFigure()
+        $waterPath.AddBezier(3.5, 16.1, 7.5, 13.8, 11.8, 18.1, 16.0, 16.0)
+        $waterPath.AddBezier(16.0, 16.0, 20.2, 13.9, 24.1, 18.0, 28.5, 15.6)
+        $waterPath.AddLine(28.5, 15.6, 28.5, 29.0)
+        $waterPath.AddLine(28.5, 29.0, 3.5, 29.0)
+        $waterPath.AddLine(3.5, 29.0, 3.5, 16.1)
+        $waterPath.CloseFigure()
+        $waterRect = [System.Drawing.RectangleF]::new(3.5, 14.0, 25.0, 15.0)
+        $waterBrush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+            $waterRect,
+            [System.Drawing.Color]::FromArgb(255, 62, 165, 218),
+            [System.Drawing.Color]::FromArgb(255, 20, 73, 160),
+            [System.Drawing.Drawing2D.LinearGradientMode]::Vertical
+        )
+        $resources.Add($waterBrush)
+        $graphics.FillPath($waterBrush, $waterPath)
+
+        $crestPen = [System.Drawing.Pen]::new(
+            [System.Drawing.Color]::FromArgb(230, 218, 249, 255),
+            1.15
+        )
+        $crestPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $crestPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $resources.Add($crestPen)
+        $graphics.DrawBezier($crestPen, 3.8, 16.0, 7.7, 13.9, 11.8, 18.0, 16.0, 16.0)
+        $graphics.DrawBezier($crestPen, 16.0, 16.0, 20.1, 14.0, 24.1, 17.9, 28.2, 15.7)
+
+        $bubbleBrush = [System.Drawing.SolidBrush]::new(
+            [System.Drawing.Color]::FromArgb(150, 218, 249, 255)
+        )
+        $resources.Add($bubbleBrush)
+        $graphics.FillEllipse($bubbleBrush, [System.Drawing.RectangleF]::new(21.2, 21.2, 2.5, 2.5))
+        $graphics.FillEllipse($bubbleBrush, [System.Drawing.RectangleF]::new(10.0, 24.0, 1.6, 1.6))
+        $graphics.ResetClip()
+
+        $rimPen = [System.Drawing.Pen]::new(
+            [System.Drawing.Color]::FromArgb(230, 169, 204, 247),
+            1.2
+        )
+        $resources.Add($rimPen)
+        $graphics.DrawEllipse($rimPen, [System.Drawing.RectangleF]::new(2.7, 2.7, 26.6, 26.6))
+
+        $highlightPen = [System.Drawing.Pen]::new(
+            [System.Drawing.Color]::FromArgb(220, 255, 255, 255),
+            1.6
+        )
+        $highlightPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $highlightPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $resources.Add($highlightPen)
+        $graphics.DrawArc($highlightPen, [System.Drawing.RectangleF]::new(6.0, 5.6, 19.0, 18.0), 190.0, 72.0)
+
+        $shineBrush = [System.Drawing.SolidBrush]::new(
+            [System.Drawing.Color]::FromArgb(225, 255, 255, 255)
+        )
+        $resources.Add($shineBrush)
+        $graphics.FillEllipse($shineBrush, [System.Drawing.RectangleF]::new(8.3, 7.0, 3.2, 2.0))
+        return $bitmap
+    } catch {
+        $bitmap.Dispose()
+        throw
+    } finally {
+        foreach ($resource in $resources) { $resource.Dispose() }
+        $graphics.Dispose()
+    }
+}
+
+function New-QuotaTrayIconResource {
+    $bitmap = New-QuotaTrayBitmap -Size 32
+    $handle = [IntPtr]::Zero
+    try {
+        $handle = $bitmap.GetHicon()
+        return ([System.Drawing.Icon]::FromHandle($handle)).Clone()
+    } finally {
+        if ($handle -ne [IntPtr]::Zero) {
+            [void][CodexQuotaOrb.TrayNative]::DestroyIcon($handle)
+        }
+        $bitmap.Dispose()
+    }
+}
+
+if ($QATrayIconPath) {
+    $preview = New-QuotaTrayBitmap -Size 32
+    try {
+        $previewDirectory = Split-Path -Parent $QATrayIconPath
+        if ($previewDirectory -and -not (Test-Path -LiteralPath $previewDirectory)) {
+            New-Item -ItemType Directory -Path $previewDirectory -Force | Out-Null
+        }
+        $preview.Save($QATrayIconPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+        $preview.Dispose()
+    }
+    exit 0
 }
 
 function Find-CodexExecutable {
@@ -159,61 +326,25 @@ function Get-CodexHomeCandidates {
         Select-Object -Unique
 }
 
-function Read-CodexChatGptAuth {
-    foreach ($codexHome in (Get-CodexHomeCandidates)) {
-        $authPath = Join-Path $codexHome 'auth.json'
-        if (-not (Test-Path -LiteralPath $authPath -PathType Leaf)) { continue }
+function ConvertTo-ResetCreditsSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$RateLimitResetCredits,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt
+    )
 
-        try {
-            $auth = Get-Content -LiteralPath $authPath -Encoding UTF8 -Raw | ConvertFrom-Json
-            if ($auth.tokens -and $auth.tokens.access_token) {
-                return [pscustomobject]@{
-                    AccessToken = [string]$auth.tokens.access_token
-                    AccountId   = if ($auth.tokens.account_id) { [string]$auth.tokens.account_id } else { $null }
-                }
-            }
-        } catch {
-            Write-Diagnostic 'Codex 登录信息暂时不可读取。'
-        }
-    }
-
-    throw '未找到可用的 Codex ChatGPT 登录。'
-}
-
-function Read-ResetCreditsFromOfficialService {
-    $auth = Read-CodexChatGptAuth
-    $headers = @{
-        Authorization = ('Bearer ' + $auth.AccessToken)
-        Accept        = 'application/json'
-        'User-Agent'  = 'CodexQuotaOrb/1.2.0'
-    }
-    if ($auth.AccountId) {
-        $headers['ChatGPT-Account-Id'] = $auth.AccountId
-    }
-
-    try {
-        # Read-only endpoint used by the installed Codex app. Never call the
-        # separate consume endpoint from this project.
-        $response = Invoke-RestMethod -Method Get `
-            -Uri 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits' `
-            -Headers $headers -TimeoutSec 15
-    } catch {
-        $statusCode = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-        if ($statusCode -eq 401 -or $statusCode -eq 403) {
-            throw 'Codex 登录已失效，请先在 Codex App 或 CLI 中重新登录。'
-        }
-        throw '重置卡服务暂时无法读取。'
+    $availableCountProperty = $RateLimitResetCredits.PSObject.Properties['availableCount']
+    if (-not $availableCountProperty -or $null -eq $availableCountProperty.Value) {
+        throw 'app-server 未返回重置卡可用数量。'
     }
 
     $availableCredits = New-Object System.Collections.Generic.List[object]
-    foreach ($credit in @($response.credits)) {
+    foreach ($credit in @($RateLimitResetCredits.credits)) {
         if (-not $credit) { continue }
         if ([string]$credit.status -ne 'available') { continue }
-        if ($credit.PSObject.Properties['is_supported_by_plan'] -and -not [bool]$credit.is_supported_by_plan) { continue }
-        if (-not $credit.expires_at) { continue }
+        if ($null -eq $credit.expiresAt) { continue }
 
         try {
-            $expiresAt = [DateTimeOffset]::Parse([string]$credit.expires_at).ToLocalTime()
+            $expiresAt = [DateTimeOffset]::FromUnixTimeSeconds([long]$credit.expiresAt).ToLocalTime()
         } catch {
             continue
         }
@@ -221,16 +352,12 @@ function Read-ResetCreditsFromOfficialService {
         $availableCredits.Add([pscustomobject]@{ ExpiresAt = $expiresAt })
     }
 
-    $serverCount = if ($response.PSObject.Properties['available_count']) {
-        [Math]::Max(0, [int]$response.available_count)
-    } else {
-        $availableCredits.Count
-    }
-
     return [pscustomobject]@{
-        AvailableCount = $serverCount
+        # The app-server contract makes availableCount authoritative because
+        # credit detail rows can be omitted or capped.
+        AvailableCount = [Math]::Max(0, [int]$availableCountProperty.Value)
         Credits        = @($availableCredits | Sort-Object ExpiresAt)
-        ObservedAt     = [DateTimeOffset]::Now
+        ObservedAt     = $ObservedAt.ToLocalTime()
     }
 }
 
@@ -238,19 +365,33 @@ function ConvertTo-RateSnapshot {
     param(
         [Parameter(Mandatory = $true)]$RateLimits,
         [Parameter(Mandatory = $true)][ValidateSet('direct', 'session')][string]$Source,
-        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt
+        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt,
+        [ValidateSet('primary', 'secondary')][string]$WindowName = 'primary'
     )
 
-    $primary = if ($Source -eq 'direct') { $RateLimits.primary } else { $RateLimits.primary }
-    if (-not $primary) {
+    $windowProperty = $RateLimits.PSObject.Properties[$WindowName]
+    $window = if ($windowProperty) { $windowProperty.Value } else { $null }
+    if (-not $window) {
         return $null
     }
 
-    $used = if ($Source -eq 'direct') { $primary.usedPercent } else { $primary.used_percent }
-    $resetEpoch = if ($Source -eq 'direct') { $primary.resetsAt } else { $primary.resets_at }
-    $windowMinutes = if ($Source -eq 'direct') { $primary.windowDurationMins } else { $primary.window_minutes }
-    $planType = if ($Source -eq 'direct') { $RateLimits.planType } else { $RateLimits.plan_type }
-    $limitId = if ($Source -eq 'direct') { $RateLimits.limitId } else { $RateLimits.limit_id }
+    $usedName = if ($Source -eq 'direct') { 'usedPercent' } else { 'used_percent' }
+    $resetName = if ($Source -eq 'direct') { 'resetsAt' } else { 'resets_at' }
+    $durationName = if ($Source -eq 'direct') { 'windowDurationMins' } else { 'window_minutes' }
+    $planName = if ($Source -eq 'direct') { 'planType' } else { 'plan_type' }
+    $limitName = if ($Source -eq 'direct') { 'limitId' } else { 'limit_id' }
+
+    $usedProperty = $window.PSObject.Properties[$usedName]
+    $resetProperty = $window.PSObject.Properties[$resetName]
+    $durationProperty = $window.PSObject.Properties[$durationName]
+    $planProperty = $RateLimits.PSObject.Properties[$planName]
+    $limitProperty = $RateLimits.PSObject.Properties[$limitName]
+
+    $used = if ($usedProperty) { $usedProperty.Value } else { $null }
+    $resetEpoch = if ($resetProperty) { $resetProperty.Value } else { $null }
+    $windowMinutes = if ($durationProperty) { $durationProperty.Value } else { $null }
+    $planType = if ($planProperty) { $planProperty.Value } else { $null }
+    $limitId = if ($limitProperty) { $limitProperty.Value } else { $null }
 
     if ($null -eq $used) {
         return $null
@@ -270,6 +411,100 @@ function ConvertTo-RateSnapshot {
         PlanType      = [string]$planType
         LimitId       = [string]$limitId
         ObservedAt    = $ObservedAt.ToLocalTime()
+        WindowName    = $WindowName
+    }
+}
+
+function ConvertTo-RateWindowPair {
+    param(
+        [Parameter(Mandatory = $true)]$RateLimits,
+        [Parameter(Mandatory = $true)][ValidateSet('direct', 'session')][string]$Source,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt
+    )
+
+    $candidates = @(
+        @(
+            ConvertTo-RateSnapshot -RateLimits $RateLimits -Source $Source -ObservedAt $ObservedAt -WindowName primary
+            ConvertTo-RateSnapshot -RateLimits $RateLimits -Source $Source -ObservedAt $ObservedAt -WindowName secondary
+        ) | Where-Object { $null -ne $_ }
+    )
+
+    if ($candidates.Count -eq 0) {
+        return $null
+    }
+
+    # Codex historically exposes a five-hour window and a one-week window.
+    # Classify by the server-provided duration instead of assuming that primary
+    # and secondary always arrive in the same order.
+    $weekly = @($candidates |
+        Sort-Object @{ Expression = {
+            if ($null -ne $_.WindowMinutes) { [long]$_.WindowMinutes } else { -1L }
+        }; Descending = $true })[0]
+
+    $fiveHourCandidates = @($candidates | Where-Object {
+        $null -ne $_.WindowMinutes -and
+        [long]$_.WindowMinutes -ge 240 -and
+        [long]$_.WindowMinutes -le 360
+    })
+    $fiveHour = if ($fiveHourCandidates.Count -gt 0) {
+        @($fiveHourCandidates |
+            Sort-Object @{ Expression = { [Math]::Abs([long]$_.WindowMinutes - 300L) } })[0]
+    } else {
+        # While Codex exposes only the weekly window, mirror it into the 5h slot.
+        # The moment a real five-hour window returns, the duration gate above
+        # selects it automatically and each card keeps its own reset timestamp.
+        $weekly
+    }
+
+    $fiveHourUsesWeeklyFallback = (
+        $candidates.Count -eq 1 -or
+        ($fiveHour.WindowName -eq $weekly.WindowName -and
+         $fiveHour.WindowMinutes -eq $weekly.WindowMinutes)
+    )
+
+    return [pscustomobject]@{
+        FiveHour                  = $fiveHour
+        Weekly                    = $weekly
+        FiveHourUsesWeeklyFallback = [bool]$fiveHourUsesWeeklyFallback
+    }
+}
+
+function ConvertTo-RateWire {
+    param($Snapshot)
+    if (-not $Snapshot) { return $null }
+
+    return [pscustomobject]@{
+        Source        = $Snapshot.Source
+        UsedPercent   = $Snapshot.UsedPercent
+        Remaining     = $Snapshot.Remaining
+        ResetEpoch    = if ($Snapshot.ResetAt) { ([DateTimeOffset]$Snapshot.ResetAt).ToUnixTimeSeconds() } else { $null }
+        WindowMinutes = $Snapshot.WindowMinutes
+        PlanType      = $Snapshot.PlanType
+        LimitId       = $Snapshot.LimitId
+        ObservedEpoch = ([DateTimeOffset]$Snapshot.ObservedAt).ToUnixTimeMilliseconds()
+        WindowName    = $Snapshot.WindowName
+    }
+}
+
+function ConvertFrom-RateWire {
+    param($Wire)
+    if (-not $Wire) { return $null }
+    $windowNameProperty = $Wire.PSObject.Properties['WindowName']
+
+    return [pscustomobject]@{
+        Source        = if ($Wire.Source) { [string]$Wire.Source } else { 'direct' }
+        UsedPercent   = [double]$Wire.UsedPercent
+        Remaining     = [double]$Wire.Remaining
+        ResetAt       = if ($null -ne $Wire.ResetEpoch) { [DateTimeOffset]::FromUnixTimeSeconds([long]$Wire.ResetEpoch).ToLocalTime() } else { $null }
+        WindowMinutes = if ($null -ne $Wire.WindowMinutes) { [long]$Wire.WindowMinutes } else { $null }
+        PlanType      = [string]$Wire.PlanType
+        LimitId       = [string]$Wire.LimitId
+        ObservedAt    = if ($null -ne $Wire.ObservedEpoch) {
+            [DateTimeOffset]::FromUnixTimeMilliseconds([long]$Wire.ObservedEpoch).ToLocalTime()
+        } else {
+            [DateTimeOffset]::Now
+        }
+        WindowName    = if ($windowNameProperty -and $windowNameProperty.Value) { [string]$windowNameProperty.Value } else { 'primary' }
     }
 }
 
@@ -293,6 +528,9 @@ function Read-AccountDataFromAppServer {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
         [void]$process.Start()
+        # Drain stderr concurrently. A verbose or newly updated Codex CLI must not
+        # fill the redirected pipe and deadlock this worker.
+        $errorReadTask = $process.StandardError.ReadToEndAsync()
         $process.StandardInput.AutoFlush = $true
 
         $initialize = @{
@@ -302,7 +540,7 @@ function Read-AccountDataFromAppServer {
                 clientInfo = @{
                     name = 'codex_rate_widget'
                     title = 'Codex Quota Orb'
-                    version = '1.2.0'
+                    version = '1.4.0'
                 }
             }
         } | ConvertTo-Json -Compress -Depth 8
@@ -319,6 +557,8 @@ function Read-AccountDataFromAppServer {
         $rateSeen = $false
         $usageSeen = $false
         $rateLimits = $null
+        $rateLimitResetCredits = $null
+        $resetCreditsFieldPresent = $false
         $usage = $null
         $rateError = $null
         $usageError = $null
@@ -348,8 +588,16 @@ function Read-AccountDataFromAppServer {
                 $rateSeen = $true
                 if ($message.PSObject.Properties.Name -contains 'error' -and $message.error) {
                     $rateError = [string]$message.error.message
-                } elseif ($message.PSObject.Properties.Name -contains 'result' -and $message.result -and $message.result.rateLimits) {
-                    $rateLimits = $message.result.rateLimits
+                } elseif ($message.PSObject.Properties.Name -contains 'result' -and $message.result) {
+                    $rateLimitsProperty = $message.result.PSObject.Properties['rateLimits']
+                    if ($rateLimitsProperty) {
+                        $rateLimits = $rateLimitsProperty.Value
+                    }
+                    $resetCreditsProperty = $message.result.PSObject.Properties['rateLimitResetCredits']
+                    if ($resetCreditsProperty) {
+                        $resetCreditsFieldPresent = $true
+                        $rateLimitResetCredits = $resetCreditsProperty.Value
+                    }
                 }
             } elseif ($message.id -eq 3) {
                 $usageSeen = $true
@@ -366,10 +614,12 @@ function Read-AccountDataFromAppServer {
         }
 
         return [pscustomobject]@{
-            RateLimits = $rateLimits
-            Usage      = $usage
-            RateError  = $rateError
-            UsageError = $usageError
+            RateLimits              = $rateLimits
+            RateLimitResetCredits   = $rateLimitResetCredits
+            ResetCreditsFieldPresent = [bool]$resetCreditsFieldPresent
+            Usage                   = $usage
+            RateError               = $rateError
+            UsageError              = $usageError
         }
     } finally {
         if ($process) {
@@ -385,15 +635,29 @@ function Read-AccountDataFromAppServer {
     }
 }
 
-function Read-RateLimitFromAppServer {
+function Read-RateWindowsFromAppServer {
     $accountData = Read-AccountDataFromAppServer
     if ($accountData.RateLimits) {
-        return ConvertTo-RateSnapshot -RateLimits $accountData.RateLimits -Source direct -ObservedAt ([DateTimeOffset]::Now)
+        return ConvertTo-RateWindowPair -RateLimits $accountData.RateLimits -Source direct -ObservedAt ([DateTimeOffset]::Now)
     }
     if ($accountData.RateError) {
         throw $accountData.RateError
     }
     throw 'app-server 未返回 rateLimits。'
+}
+
+function Read-ResetCreditsFromAppServer {
+    $observedAt = [DateTimeOffset]::Now
+    $accountData = Read-AccountDataFromAppServer
+    if ($accountData.ResetCreditsFieldPresent -and $null -ne $accountData.RateLimitResetCredits) {
+        return ConvertTo-ResetCreditsSnapshot `
+            -RateLimitResetCredits $accountData.RateLimitResetCredits `
+            -ObservedAt $observedAt
+    }
+    if ($accountData.RateError) {
+        throw $accountData.RateError
+    }
+    throw '当前 app-server 未提供 rateLimitResetCredits。'
 }
 
 function Get-LatestRolloutFile {
@@ -413,7 +677,64 @@ function Get-LatestRolloutFile {
     return $candidates | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
 }
 
-function Read-RateLimitFromSessionEvents {
+function Read-BoundedFileTailLines {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateRange(1, 10000)][int]$MaxLines = 120,
+        [ValidateRange(4096, 16777216)][int]$MaxBytes = 4194304
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return @()
+    }
+
+    $stream = $null
+    try {
+        $stream = New-Object System.IO.FileStream(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite,
+            65536,
+            [System.IO.FileOptions]::SequentialScan
+        )
+        $bytesToRead = [int][Math]::Min([long]$MaxBytes, $stream.Length)
+        if ($bytesToRead -le 0) {
+            return @()
+        }
+
+        $startOffset = $stream.Length - $bytesToRead
+        [void]$stream.Seek($startOffset, [System.IO.SeekOrigin]::Begin)
+        $buffer = New-Object byte[] $bytesToRead
+        $totalRead = 0
+        while ($totalRead -lt $bytesToRead) {
+            $read = $stream.Read($buffer, $totalRead, $bytesToRead - $totalRead)
+            if ($read -le 0) { break }
+            $totalRead += $read
+        }
+
+        $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $totalRead)
+        if ($startOffset -gt 0) {
+            # The byte window normally begins inside a JSONL record. Discard that
+            # partial record instead of parsing a potentially huge tool payload.
+            $firstLineBreak = $text.IndexOf("`n", [StringComparison]::Ordinal)
+            if ($firstLineBreak -lt 0) {
+                return @()
+            }
+            $text = $text.Substring($firstLineBreak + 1)
+        }
+
+        $lines = @($text -split "`r?`n")
+        if ($lines.Count -gt 0 -and [string]::IsNullOrEmpty([string]$lines[$lines.Count - 1])) {
+            $lines = @($lines | Select-Object -First ($lines.Count - 1))
+        }
+        return @($lines | Select-Object -Last $MaxLines)
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Read-RateWindowsFromSessionEvents {
     $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
     foreach ($codexHome in (Get-CodexHomeCandidates)) {
         for ($offset = 0; $offset -le 7; $offset++) {
@@ -428,9 +749,9 @@ function Read-RateLimitFromSessionEvents {
     }
 
     foreach ($file in ($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 4)) {
-        # Recent token-count snapshots occur near the tail. Keep this gate bounded so
-        # image/tool-heavy sessions cannot block the WPF dispatcher during startup.
-        $lines = @(Get-Content -LiteralPath $file.FullName -Encoding UTF8 -Tail 120 -ErrorAction SilentlyContinue)
+        # Get-Content -Tail can scan an entire JSONL file when a tool payload creates
+        # a very long line. Read a hard-bounded byte window instead.
+        $lines = @(Read-BoundedFileTailLines -Path $file.FullName -MaxLines 120 -MaxBytes 4194304)
         for ($index = $lines.Count - 1; $index -ge 0; $index--) {
             $line = $lines[$index]
             if ($line -notlike '*"type":"token_count"*' -or $line -notlike '*"rate_limits"*') {
@@ -445,7 +766,7 @@ function Read-RateLimitFromSessionEvents {
 
             if ($event.type -eq 'event_msg' -and $event.payload.type -eq 'token_count' -and $event.payload.rate_limits) {
                 $observedAt = [DateTimeOffset]::Parse([string]$event.timestamp)
-                return ConvertTo-RateSnapshot -RateLimits $event.payload.rate_limits -Source session -ObservedAt $observedAt
+                return ConvertTo-RateWindowPair -RateLimits $event.payload.rate_limits -Source session -ObservedAt $observedAt
             }
         }
     }
@@ -453,36 +774,65 @@ function Read-RateLimitFromSessionEvents {
     return $null
 }
 
-if ($DirectWorker) {
-    $workerAccount = Read-AccountDataFromAppServer
-    $workerSnapshot = if ($workerAccount.RateLimits) {
-        ConvertTo-RateSnapshot -RateLimits $workerAccount.RateLimits -Source direct -ObservedAt ([DateTimeOffset]::Now)
-    } else {
-        $null
+function Read-RateLimitFromHistory {
+    $lines = @(Read-BoundedFileTailLines -Path $script:RateHistoryPath -MaxLines 20 -MaxBytes 262144)
+    for ($index = $lines.Count - 1; $index -ge 0; $index--) {
+        try {
+            $item = $lines[$index] | ConvertFrom-Json
+            if ($null -eq $item.usedPercent -or -not $item.timestamp) { continue }
+            $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$item.usedPercent))
+            return [pscustomobject]@{
+                Source        = if ($item.source) { [string]$item.source } else { 'history' }
+                UsedPercent   = $usedPercent
+                Remaining     = 100.0 - $usedPercent
+                ResetAt       = if ($null -ne $item.resetEpoch) { [DateTimeOffset]::FromUnixTimeSeconds([long]$item.resetEpoch).ToLocalTime() } else { $null }
+                WindowMinutes = if ($null -ne $item.windowMinutes) { [long]$item.windowMinutes } else { $null }
+                PlanType      = $null
+                LimitId       = if ($item.limitId) { [string]$item.limitId } else { 'codex' }
+                ObservedAt    = [DateTimeOffset]::Parse([string]$item.timestamp).ToLocalTime()
+            }
+        } catch {
+            continue
+        }
     }
+    return $null
+}
+
+if ($DirectWorker) {
+    $workerAccount = $null
+    $workerWindows = $null
+    $workerFailure = $null
+    try {
+        $workerAccount = Read-AccountDataFromAppServer
+        if ($workerAccount.RateLimits) {
+            $workerWindows = ConvertTo-RateWindowPair -RateLimits $workerAccount.RateLimits -Source direct -ObservedAt ([DateTimeOffset]::Now)
+        }
+    } catch {
+        $workerFailure = $_.Exception.Message
+        # This fallback remains inside the worker process, never on the WPF thread.
+        $workerWindows = Read-RateWindowsFromSessionEvents
+    }
+    $workerSnapshot = if ($workerWindows) { $workerWindows.FiveHour } else { $null }
     [pscustomobject]@{
-        Rate = if ($workerSnapshot) {
+        # Rate remains for compatibility with installed 1.3.x UI workers.
+        Rate = (ConvertTo-RateWire $workerSnapshot)
+        Rates = if ($workerWindows) {
             [pscustomobject]@{
-                Source        = $workerSnapshot.Source
-                UsedPercent   = $workerSnapshot.UsedPercent
-                Remaining     = $workerSnapshot.Remaining
-                ResetEpoch    = if ($workerSnapshot.ResetAt) { ([DateTimeOffset]$workerSnapshot.ResetAt).ToUnixTimeSeconds() } else { $null }
-                WindowMinutes = $workerSnapshot.WindowMinutes
-                PlanType      = $workerSnapshot.PlanType
-                LimitId       = $workerSnapshot.LimitId
-                ObservedEpoch = ([DateTimeOffset]$workerSnapshot.ObservedAt).ToUnixTimeMilliseconds()
+                FiveHour                   = (ConvertTo-RateWire $workerWindows.FiveHour)
+                Weekly                     = (ConvertTo-RateWire $workerWindows.Weekly)
+                FiveHourUsesWeeklyFallback = [bool]$workerWindows.FiveHourUsesWeeklyFallback
             }
         } else { $null }
-        Usage      = $workerAccount.Usage
-        RateError  = $workerAccount.RateError
-        UsageError = $workerAccount.UsageError
+        Usage      = if ($workerAccount) { $workerAccount.Usage } else { $null }
+        RateError  = if ($workerAccount) { $workerAccount.RateError } else { $workerFailure }
+        UsageError = if ($workerAccount) { $workerAccount.UsageError } else { $workerFailure }
     } | ConvertTo-Json -Compress -Depth 8
     exit 0
 }
 
 if ($ResetCreditsWorker) {
     try {
-        $resetCredits = Read-ResetCreditsFromOfficialService
+        $resetCredits = Read-ResetCreditsFromAppServer
         [pscustomobject]@{
             AvailableCount = [int]$resetCredits.AvailableCount
             Credits        = @($resetCredits.Credits | ForEach-Object {
@@ -499,19 +849,79 @@ if ($ResetCreditsWorker) {
     }
 }
 
+if ($AnalyticsWorker) {
+    try {
+        if (-not (Test-Path -LiteralPath $script:UsageAnalyticsPath -PathType Leaf)) {
+            throw '未找到 UsageAnalytics.py。'
+        }
+        $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+        if (-not $pythonCommand) { $pythonCommand = Get-Command python -ErrorAction SilentlyContinue }
+        if (-not $pythonCommand -or -not $pythonCommand.Source) { throw '未找到 Python。' }
+
+        $arguments = New-Object System.Collections.Generic.List[string]
+        $arguments.Add($script:UsageAnalyticsPath)
+        foreach ($codexHome in (Get-CodexHomeCandidates)) {
+            $arguments.Add('--codex-home')
+            $arguments.Add([string]$codexHome)
+        }
+        if ($arguments.Count -le 1) { throw '未找到 Codex 本地目录。' }
+        $userProfile = [Environment]::GetFolderPath('UserProfile')
+        foreach ($userSkillRoot in @(
+            (Join-Path $userProfile '.agents\skills'),
+            (Join-Path $userProfile '.codex\skills')
+        )) {
+            if (Test-Path -LiteralPath $userSkillRoot) {
+                $arguments.Add('--skill-root')
+                $arguments.Add($userSkillRoot)
+            }
+        }
+        $codexConfigPath = Join-Path $userProfile '.codex\config.toml'
+        if (Test-Path -LiteralPath $codexConfigPath -PathType Leaf) {
+            $arguments.Add('--codex-config')
+            $arguments.Add($codexConfigPath)
+        }
+        $arguments.Add('--cache')
+        $arguments.Add($script:UsageCachePath)
+        $arguments.Add('--rate-history')
+        $arguments.Add($script:RateHistoryPath)
+        $arguments.Add('--days')
+        $arguments.Add('7')
+
+        $output = & $pythonCommand.Source @arguments
+        if ($LASTEXITCODE -ne 0 -or -not $output) { throw '统计进程未返回数据。' }
+        $output
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 1
+    }
+}
+
 if ($HeadlessProbe) {
     try {
         try {
-            $probeSnapshot = Read-RateLimitFromAppServer
+            $probeWindows = Read-RateWindowsFromAppServer
         } catch {
             Write-Diagnostic ('Direct read unavailable: ' + $_.Exception.Message)
-            $probeSnapshot = Read-RateLimitFromSessionEvents
+            $probeWindows = Read-RateWindowsFromSessionEvents
         }
 
-        if (-not $probeSnapshot) {
+        if (-not $probeWindows) {
             throw '未找到可用额度快照。'
         }
-        $probeSnapshot | ConvertTo-Json -Depth 6
+        $probeSnapshot = $probeWindows.FiveHour
+        [pscustomobject]@{
+            Source                      = $probeSnapshot.Source
+            UsedPercent                 = $probeSnapshot.UsedPercent
+            Remaining                   = $probeSnapshot.Remaining
+            ResetAt                     = $probeSnapshot.ResetAt
+            WindowMinutes               = $probeSnapshot.WindowMinutes
+            PlanType                    = $probeSnapshot.PlanType
+            LimitId                     = $probeSnapshot.LimitId
+            ObservedAt                  = $probeSnapshot.ObservedAt
+            Weekly                      = (ConvertTo-RateWire $probeWindows.Weekly)
+            FiveHourUsesWeeklyFallback  = [bool]$probeWindows.FiveHourUsesWeeklyFallback
+        } | ConvertTo-Json -Depth 6
         exit 0
     } finally {
         if ($mutex) {
@@ -926,13 +1336,12 @@ if ($HeadlessProbe) {
                 <Grid.RowDefinitions>
                     <RowDefinition Height="38"/>
                     <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="16"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
-                <Border Grid.RowSpan="6" Margin="-8,-6,-8,-7" CornerRadius="24" IsHitTestVisible="False">
+                <Border Grid.RowSpan="5" Margin="-8,-6,-8,-7" CornerRadius="24" IsHitTestVisible="False">
                     <Border.Background>
                         <RadialGradientBrush Center="0.18,0.06" GradientOrigin="0.12,0.02" RadiusX="0.88" RadiusY="0.78">
                             <GradientStop Color="#42FFFFFF" Offset="0"/>
@@ -941,8 +1350,8 @@ if ($HeadlessProbe) {
                         </RadialGradientBrush>
                     </Border.Background>
                 </Border>
-                <Border Grid.RowSpan="6" Margin="-8,-6,-8,-7" CornerRadius="24" Background="{StaticResource GlassSpecularBrush}" Opacity="0.9" IsHitTestVisible="False"/>
-                <Border Grid.RowSpan="6" Margin="-8,-6,-8,-7" CornerRadius="24" IsHitTestVisible="False">
+                <Border Grid.RowSpan="5" Margin="-8,-6,-8,-7" CornerRadius="24" Background="{StaticResource GlassSpecularBrush}" Opacity="0.9" IsHitTestVisible="False"/>
+                <Border Grid.RowSpan="5" Margin="-8,-6,-8,-7" CornerRadius="24" IsHitTestVisible="False">
                     <Border.Background>
                         <RadialGradientBrush Center="0.76,1.06" GradientOrigin="0.82,1.1" RadiusX="0.82" RadiusY="0.48">
                             <GradientStop Color="#323C91B8" Offset="0"/>
@@ -951,9 +1360,9 @@ if ($HeadlessProbe) {
                         </RadialGradientBrush>
                     </Border.Background>
                 </Border>
-                <Border Grid.RowSpan="6" Margin="-8,-6,-8,-7" CornerRadius="24" Background="{StaticResource GlassTexture}" Opacity="0.22" IsHitTestVisible="False"/>
-                <Border Grid.RowSpan="6" Margin="-5,-3,-5,-4" CornerRadius="22" BorderThickness="1.15" BorderBrush="{StaticResource GlassInnerEdgeBrush}" IsHitTestVisible="False"/>
-                <Border Grid.RowSpan="6" Margin="-2,0,-2,-1" CornerRadius="19" BorderThickness="1" BorderBrush="#36000000" IsHitTestVisible="False"/>
+                <Border Grid.RowSpan="5" Margin="-8,-6,-8,-7" CornerRadius="24" Background="{StaticResource GlassTexture}" Opacity="0.22" IsHitTestVisible="False"/>
+                <Border Grid.RowSpan="5" Margin="-5,-3,-5,-4" CornerRadius="22" BorderThickness="1.15" BorderBrush="{StaticResource GlassInnerEdgeBrush}" IsHitTestVisible="False"/>
+                <Border Grid.RowSpan="5" Margin="-2,0,-2,-1" CornerRadius="19" BorderThickness="1" BorderBrush="#36000000" IsHitTestVisible="False"/>
 
                 <Grid Grid.Row="0">
                     <Grid.ColumnDefinitions>
@@ -966,59 +1375,97 @@ if ($HeadlessProbe) {
                         </Border>
                         <StackPanel>
                             <TextBlock Text="C O D E X" Foreground="#BFFFFFFF" FontSize="9" FontWeight="Bold"/>
-                            <TextBlock Text="Weekly capacity" Foreground="#F5FFFFFF" FontSize="15" FontWeight="Bold" Margin="0,-1,0,0"/>
+                            <TextBlock Text="5h · 1周额度" Foreground="#F5FFFFFF" FontSize="15" FontWeight="Bold" Margin="0,-1,0,0"/>
                         </StackPanel>
                     </StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button x:Name="OrbStyleToggleButton" Style="{StaticResource WindowButton}" ToolTip="切换悬浮球样式" AutomationProperties.Name="切换悬浮球样式">
+                            <Grid Width="18" Height="10">
+                                <Ellipse x:Name="ClassicStyleDot" Width="8" Height="8" HorizontalAlignment="Left" Fill="#FF4D9FE8" Stroke="#F2FFFFFF" StrokeThickness="1.3"/>
+                                <Ellipse x:Name="GradientStyleDot" Width="8" Height="8" HorizontalAlignment="Right" Stroke="#54FFFFFF" StrokeThickness="1">
+                                    <Ellipse.Fill>
+                                        <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                            <GradientStop Color="#FF2F75D6" Offset="0"/>
+                                            <GradientStop Color="#FF31A58F" Offset="0.5"/>
+                                            <GradientStop Color="#FFF0642F" Offset="1"/>
+                                        </LinearGradientBrush>
+                                    </Ellipse.Fill>
+                                </Ellipse>
+                            </Grid>
+                        </Button>
                         <Button x:Name="RefreshButton" Style="{StaticResource WindowButton}" Content="↻" ToolTip="刷新额度"/>
                         <Button x:Name="HideButton" Style="{StaticResource WindowButton}" Content="—" ToolTip="收拢为水球"/>
                         <Button x:Name="CloseButton" Style="{StaticResource WindowButton}" Content="×" ToolTip="退出"/>
                     </StackPanel>
                 </Grid>
 
-                <Grid Grid.Row="1" Margin="0,9,0,8" Height="78">
+                <Grid Grid.Row="1" Margin="0,9,0,9" Height="180">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
-                    <Grid Grid.Column="0" VerticalAlignment="Center">
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="18"/>
-                            <RowDefinition Height="60"/>
-                        </Grid.RowDefinitions>
-                        <TextBlock Grid.Row="0" Text="R E M A I N I N G" Foreground="#BFFFFFFF" FontSize="9" FontWeight="Bold" VerticalAlignment="Top"/>
-                        <TextBlock x:Name="PercentText" Grid.Row="1" Text="--%" Foreground="#FFFFFFFF" FontFamily="{StaticResource InterfaceDisplayFont}" FontSize="48" FontWeight="Bold" VerticalAlignment="Center"/>
-                    </Grid>
-                    <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
-                        <Border x:Name="SourceBadge" Background="#242A4E76" CornerRadius="10" Padding="10,5">
-                            <TextBlock x:Name="SourceText" Text="CONNECTING" Foreground="#64AFFF" FontSize="9" FontWeight="Bold"/>
-                        </Border>
-                        <TextBlock x:Name="UsedText" Text="正在读取额度" Foreground="#E8FFFFFF" FontSize="11" FontWeight="SemiBold" HorizontalAlignment="Right" Margin="0,6,2,0"/>
-                    </StackPanel>
-                </Grid>
+                    <Border Grid.Column="0" Margin="0,0,5,0" CornerRadius="18" BorderThickness="1" BorderBrush="#35FFFFFF" Background="#2A142130">
+                        <Grid Margin="14,11,14,12">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="22"/>
+                                <RowDefinition Height="46"/>
+                                <RowDefinition Height="8"/>
+                                <RowDefinition Height="24"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Grid Grid.Row="0">
+                                <TextBlock Text="5h" Foreground="#F5FFFFFF" FontSize="13" FontWeight="Bold" VerticalAlignment="Center"/>
+                                <TextBlock x:Name="FiveHourFallbackText" Text="周窗口回退" Foreground="#FFFFC866" FontSize="7.5" FontWeight="Bold" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                            </Grid>
+                            <TextBlock x:Name="PercentText" Grid.Row="1" Text="--%" Foreground="#FFFFFFFF" FontFamily="{StaticResource InterfaceDisplayFont}" FontSize="35" FontWeight="Bold" VerticalAlignment="Center"/>
+                            <Grid x:Name="ProgressTrack" Grid.Row="2" Height="7">
+                                <Border Background="#55343438" CornerRadius="3.5"/>
+                                <Border x:Name="CapacityFill" HorizontalAlignment="Left" Width="0" Background="#0A84FF" CornerRadius="3.5"/>
+                            </Grid>
+                            <TextBlock x:Name="FiveHourUsedText" Grid.Row="3" Text="正在读取额度" Foreground="#CFFFFFFF" FontSize="9.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                            <StackPanel Grid.Row="4" Margin="0,5,0,0">
+                                <TextBlock Text="R E S E T" Foreground="#7FFFFFFF" FontSize="7.5" FontWeight="Bold"/>
+                                <TextBlock x:Name="FiveHourResetText" Text="等待快照" Foreground="#F2FFFFFF" FontSize="9.5" FontWeight="SemiBold" TextWrapping="Wrap" LineHeight="14" Margin="0,3,0,0"/>
+                            </StackPanel>
+                        </Grid>
+                    </Border>
 
-                <Grid x:Name="ProgressTrack" Grid.Row="2" Height="12">
-                    <Border Background="#55343438" CornerRadius="6"/>
-                    <Border x:Name="CapacityFill" HorizontalAlignment="Left" Width="0" Background="#0A84FF" CornerRadius="6">
-                        <Border.Effect>
-                            <DropShadowEffect Color="#0A84FF" BlurRadius="9" ShadowDepth="0" Opacity="0.35"/>
-                        </Border.Effect>
+                    <Border Grid.Column="1" Margin="5,0,0,0" CornerRadius="18" BorderThickness="1" BorderBrush="#35FFFFFF" Background="#2A142130">
+                        <Grid Margin="14,11,14,12">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="22"/>
+                                <RowDefinition Height="46"/>
+                                <RowDefinition Height="8"/>
+                                <RowDefinition Height="24"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Text="1周" Foreground="#F5FFFFFF" FontSize="13" FontWeight="Bold" VerticalAlignment="Center"/>
+                            <TextBlock x:Name="WeeklyPercentText" Grid.Row="1" Text="--%" Foreground="#FFFFFFFF" FontFamily="{StaticResource InterfaceDisplayFont}" FontSize="35" FontWeight="Bold" VerticalAlignment="Center"/>
+                            <Grid x:Name="WeeklyProgressTrack" Grid.Row="2" Height="7">
+                                <Border Background="#55343438" CornerRadius="3.5"/>
+                                <Border x:Name="WeeklyCapacityFill" HorizontalAlignment="Left" Width="0" Background="#0A84FF" CornerRadius="3.5"/>
+                            </Grid>
+                            <TextBlock x:Name="WeeklyUsedText" Grid.Row="3" Text="正在读取额度" Foreground="#CFFFFFFF" FontSize="9.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                            <StackPanel Grid.Row="4" Margin="0,5,0,0">
+                                <TextBlock Text="R E S E T" Foreground="#7FFFFFFF" FontSize="7.5" FontWeight="Bold"/>
+                                <TextBlock x:Name="WeeklyResetText" Text="等待快照" Foreground="#F2FFFFFF" FontSize="9.5" FontWeight="SemiBold" TextWrapping="Wrap" LineHeight="14" Margin="0,3,0,0"/>
+                            </StackPanel>
+                        </Grid>
                     </Border>
                 </Grid>
 
-                <Grid Grid.Row="3" Margin="0,13,0,0">
-                    <StackPanel>
-                        <TextBlock Text="R E S E T" Foreground="#8FFFFFFF" FontSize="8" FontWeight="Bold"/>
-                        <TextBlock x:Name="ResetText" Text="等待快照" Foreground="#FFFFFFFF" FontSize="12" FontWeight="SemiBold" Margin="0,3,0,0"/>
-                    </StackPanel>
-                    <StackPanel HorizontalAlignment="Right">
-                        <TextBlock Text="U P D A T E D" Foreground="#8FFFFFFF" FontSize="8" FontWeight="Bold" HorizontalAlignment="Right"/>
-                        <TextBlock x:Name="UpdatedText" Text="--:--" Foreground="#F0FFFFFF" FontSize="12" FontWeight="SemiBold" Margin="0,3,0,0" HorizontalAlignment="Right"/>
+                <Grid Grid.Row="2" Margin="0,0,0,0">
+                    <Border x:Name="SourceBadge" Background="#242A4E76" CornerRadius="10" Padding="10,5" HorizontalAlignment="Left">
+                        <TextBlock x:Name="SourceText" Text="CONNECTING" Foreground="#64AFFF" FontSize="9" FontWeight="Bold"/>
+                    </Border>
+                    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="UPDATED" Foreground="#7FFFFFFF" FontSize="8" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <TextBlock x:Name="UpdatedText" Text="--:--" Foreground="#F0FFFFFF" FontSize="10" FontWeight="SemiBold" VerticalAlignment="Center"/>
                     </StackPanel>
                 </Grid>
 
-                <Button x:Name="AnalyticsButton" Grid.Row="4" Content="查看用量分析  ›" Style="{StaticResource ActionButton}" Margin="0,12,0,0"/>
-                <Button x:Name="ResetCreditsButton" Grid.Row="5" Content="查看重置卡  ›" Style="{StaticResource ActionButton}" Margin="0,8,0,0"/>
+                <Button x:Name="AnalyticsButton" Grid.Row="3" Content="查看用量分析  ›" Style="{StaticResource ActionButton}" Margin="0,12,0,0"/>
+                <Button x:Name="ResetCreditsButton" Grid.Row="4" Content="查看重置卡  ›" Style="{StaticResource ActionButton}" Margin="0,8,0,0"/>
             </Grid>
         </Border>
 
@@ -1074,7 +1521,7 @@ if ($HeadlessProbe) {
                     <Button x:Name="BackButton" Grid.Column="0" Style="{StaticResource WindowButton}" Content="‹" ToolTip="返回额度页" Margin="0,0,8,0"/>
                     <StackPanel Grid.Column="1" VerticalAlignment="Center">
                         <TextBlock Text="C O D E X" Foreground="#BFFFFFFF" FontSize="9" FontWeight="Bold"/>
-                        <TextBlock Text="Usage analytics" Foreground="#F5FFFFFF" FontSize="15" FontWeight="Bold" Margin="0,-1,0,0"/>
+                        <TextBlock Text="Token 与工作流" Foreground="#F5FFFFFF" FontSize="15" FontWeight="Bold" Margin="0,-1,0,0"/>
                     </StackPanel>
                     <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
                         <Button x:Name="AnalyticsRefreshButton" Style="{StaticResource WindowButton}" Content="↻" ToolTip="刷新统计"/>
@@ -1094,16 +1541,17 @@ if ($HeadlessProbe) {
                     </StackPanel>
                     <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
                         <Border Background="#242A4E76" CornerRadius="10" Padding="10,5">
-                            <TextBlock x:Name="AnalyticsSourceText" Text="LOCAL EVENTS" Foreground="#64AFFF" FontSize="9" FontWeight="Bold"/>
+                            <TextBlock x:Name="AnalyticsSourceText" Text="LOCAL · 0 TOKEN" Foreground="#64AFFF" FontSize="9" FontWeight="Bold"/>
                         </Border>
                         <TextBlock x:Name="OfficialRateText" Text="官方额度 --" Foreground="#BFFFFFFF" FontSize="10" HorizontalAlignment="Right" Margin="0,5,2,0"/>
                     </StackPanel>
                 </Grid>
 
-                <UniformGrid Grid.Row="2" Columns="3" Margin="0,4,0,5">
-                    <Button x:Name="DailyTabButton" Content="7 日" Style="{StaticResource TabButton}"/>
+                <UniformGrid Grid.Row="2" Columns="4" Margin="0,4,0,5">
+                    <Button x:Name="DailyTabButton" Content="Token" Style="{StaticResource TabButton}"/>
                     <Button x:Name="SkillTabButton" Content="Skill" Style="{StaticResource TabButton}"/>
-                    <Button x:Name="AgentTabButton" Content="Agent" Style="{StaticResource TabButton}" Margin="0"/>
+                    <Button x:Name="AgentTabButton" Content="Agent" Style="{StaticResource TabButton}"/>
+                    <Button x:Name="ToolTabButton" Content="Tool" Style="{StaticResource TabButton}" Margin="0"/>
                 </UniformGrid>
 
                 <Grid Grid.Row="3">
@@ -1111,6 +1559,7 @@ if ($HeadlessProbe) {
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
                         <Grid Grid.Row="0" Margin="1,4,1,7">
@@ -1121,6 +1570,7 @@ if ($HeadlessProbe) {
                             <StackPanel x:Name="DailyRowsPanel"/>
                         </ScrollViewer>
                         <TextBlock x:Name="RateHistoryText" Grid.Row="2" Text="官方额度日拆分正在积累快照" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
+                        <StackPanel x:Name="WorkflowHintsPanel" Grid.Row="3" Margin="1,6,0,0"/>
                     </Grid>
 
                     <Grid x:Name="SkillPanel" Visibility="Collapsed">
@@ -1131,12 +1581,12 @@ if ($HeadlessProbe) {
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
                         <Grid Grid.Row="0" Margin="1,4,1,7">
-                            <TextBlock x:Name="SkillSectionTitle" Text="SKILL · 主归因 TOKEN" Foreground="#D0FFFFFF" FontSize="10" FontWeight="Bold"/>
-                            <TextBlock x:Name="SkillCoverageText" Text="覆盖率 --" Foreground="#64AFFF" FontSize="9" FontWeight="Bold" HorizontalAlignment="Right"/>
+                            <TextBlock x:Name="SkillSectionTitle" Text="SKILL · 使用情况" Foreground="#D0FFFFFF" FontSize="10" FontWeight="Bold"/>
+                            <TextBlock x:Name="SkillCoverageText" Text="归因覆盖 --" Foreground="#64AFFF" FontSize="9" FontWeight="Bold" HorizontalAlignment="Right"/>
                         </Grid>
                         <UniformGrid Grid.Row="1" Columns="2" Margin="0,0,0,6">
-                            <Button x:Name="SkillPrimaryButton" Content="12 Skill" Style="{StaticResource TabButton}"/>
-                            <Button x:Name="SkillChainButton" Content="路由链" Style="{StaticResource TabButton}" Margin="0"/>
+                            <Button x:Name="SkillPrimaryButton" Content="可用 Skill" Style="{StaticResource TabButton}"/>
+                            <Button x:Name="SkillChainButton" Content="组合链" Style="{StaticResource TabButton}" Margin="0"/>
                         </UniformGrid>
                         <Grid Grid.Row="2">
                             <ScrollViewer x:Name="SkillPrimaryScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
@@ -1146,7 +1596,7 @@ if ($HeadlessProbe) {
                                 <StackPanel x:Name="SkillChainRowsPanel"/>
                             </ScrollViewer>
                         </Grid>
-                        <TextBlock x:Name="SkillHintText" Grid.Row="3" Text="主归因只计最终 Skill；关联 Token 不可相加。" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
+                        <TextBlock x:Name="SkillHintText" Grid.Row="3" Text="参与 Token 会重复归因；归因覆盖率仍按每个 Turn 只计一次。" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
                     </Grid>
 
                     <Grid x:Name="AgentPanel" Visibility="Collapsed">
@@ -1156,13 +1606,29 @@ if ($HeadlessProbe) {
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
                         <Grid Grid.Row="0" Margin="1,4,1,7">
-                            <TextBlock Text="AGENT · THREAD 归因" Foreground="#D0FFFFFF" FontSize="10" FontWeight="Bold"/>
-                            <TextBlock Text="包含主 Agent" Foreground="#64AFFF" FontSize="9" FontWeight="Bold" HorizontalAlignment="Right"/>
+                            <TextBlock Text="AGENT · 使用情况" Foreground="#D0FFFFFF" FontSize="10" FontWeight="Bold"/>
+                            <TextBlock x:Name="AgentSummaryText" Text="主/子 Agent" Foreground="#64AFFF" FontSize="9" FontWeight="Bold" HorizontalAlignment="Right"/>
                         </Grid>
                         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                             <StackPanel x:Name="AgentRowsPanel"/>
                         </ScrollViewer>
-                        <TextBlock Grid.Row="2" Text="按线程角色汇总本机捕获到的 Token；不与账户级总量混用分母。" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
+                        <TextBlock Grid.Row="2" Text="主 Agent 按项目显示，子 Agent 按角色显示；这里是本地 Token，不等于官方额度。" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
+                    </Grid>
+
+                    <Grid x:Name="ToolPanel" Visibility="Collapsed">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <Grid Grid.Row="0" Margin="1,4,1,7">
+                            <TextBlock Text="TOOL · 本地调用" Foreground="#D0FFFFFF" FontSize="10" FontWeight="Bold"/>
+                            <TextBlock x:Name="ToolSummaryText" Text="等待统计" Foreground="#64AFFF" FontSize="9" FontWeight="Bold" HorizontalAlignment="Right"/>
+                        </Grid>
+                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel x:Name="ToolRowsPanel"/>
+                        </ScrollViewer>
+                        <TextBlock x:Name="ToolHintText" Grid.Row="2" Text="仅读取已有本地记录；不调用模型，不连接或探测 MCP Server。" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
                     </Grid>
                 </Grid>
 
@@ -1286,13 +1752,22 @@ $StatusDot = $window.FindName('StatusDot')
 $PercentText = $window.FindName('PercentText')
 $SourceBadge = $window.FindName('SourceBadge')
 $SourceText = $window.FindName('SourceText')
-$UsedText = $window.FindName('UsedText')
+$FiveHourFallbackText = $window.FindName('FiveHourFallbackText')
+$FiveHourUsedText = $window.FindName('FiveHourUsedText')
 $ProgressTrack = $window.FindName('ProgressTrack')
 $CapacityFill = $window.FindName('CapacityFill')
-$ResetText = $window.FindName('ResetText')
+$FiveHourResetText = $window.FindName('FiveHourResetText')
+$WeeklyPercentText = $window.FindName('WeeklyPercentText')
+$WeeklyUsedText = $window.FindName('WeeklyUsedText')
+$WeeklyProgressTrack = $window.FindName('WeeklyProgressTrack')
+$WeeklyCapacityFill = $window.FindName('WeeklyCapacityFill')
+$WeeklyResetText = $window.FindName('WeeklyResetText')
 $UpdatedText = $window.FindName('UpdatedText')
 $AnalyticsButton = $window.FindName('AnalyticsButton')
 $ResetCreditsButton = $window.FindName('ResetCreditsButton')
+$OrbStyleToggleButton = $window.FindName('OrbStyleToggleButton')
+$ClassicStyleDot = $window.FindName('ClassicStyleDot')
+$GradientStyleDot = $window.FindName('GradientStyleDot')
 $RefreshButton = $window.FindName('RefreshButton')
 $HideButton = $window.FindName('HideButton')
 $CloseButton = $window.FindName('CloseButton')
@@ -1307,13 +1782,20 @@ $OfficialRateText = $window.FindName('OfficialRateText')
 $DailyTabButton = $window.FindName('DailyTabButton')
 $SkillTabButton = $window.FindName('SkillTabButton')
 $AgentTabButton = $window.FindName('AgentTabButton')
+$ToolTabButton = $window.FindName('ToolTabButton')
 $DailyPanel = $window.FindName('DailyPanel')
 $SkillPanel = $window.FindName('SkillPanel')
 $AgentPanel = $window.FindName('AgentPanel')
+$ToolPanel = $window.FindName('ToolPanel')
 $DailyRowsPanel = $window.FindName('DailyRowsPanel')
 $SkillRowsPanel = $window.FindName('SkillRowsPanel')
 $SkillChainRowsPanel = $window.FindName('SkillChainRowsPanel')
 $AgentRowsPanel = $window.FindName('AgentRowsPanel')
+$ToolRowsPanel = $window.FindName('ToolRowsPanel')
+$AgentSummaryText = $window.FindName('AgentSummaryText')
+$ToolSummaryText = $window.FindName('ToolSummaryText')
+$ToolHintText = $window.FindName('ToolHintText')
+$WorkflowHintsPanel = $window.FindName('WorkflowHintsPanel')
 $DailySourceText = $window.FindName('DailySourceText')
 $RateHistoryText = $window.FindName('RateHistoryText')
 $SkillCoverageText = $window.FindName('SkillCoverageText')
@@ -1335,6 +1817,20 @@ $ResetCreditsRowsPanel = $window.FindName('ResetCreditsRowsPanel')
 $ResetCreditsStatePanel = $window.FindName('ResetCreditsStatePanel')
 $ResetCreditsStateText = $window.FindName('ResetCreditsStateText')
 $ResetCreditsRetryButton = $window.FindName('ResetCreditsRetryButton')
+
+$script:ClassicOrbVisuals = [pscustomobject]@{
+    AtmosphereFill   = $OrbAtmosphereFill.Fill.Clone()
+    WaterFill        = $OrbWaterFill.Fill.Clone()
+    WaterGloss       = $OrbWaterGloss.Fill.Clone()
+    WaterSheen       = $OrbWaterSheen.Fill.Clone()
+    WaveBackStroke   = $OrbWaveBack.Stroke.Clone()
+    WaveBackFill     = $OrbWaveBack.Fill.Clone()
+    WaveShadeStroke  = $OrbWaveShade.Stroke.Clone()
+    WaveFrontStroke  = $OrbWaveFront.Stroke.Clone()
+    WaveFrontFill    = $OrbWaveFront.Fill.Clone()
+    PercentForeground = $OrbPercentText.Foreground.Clone()
+    PercentEffect    = $OrbPercentText.Effect.Clone()
+}
 
 function New-Brush {
     param([string]$Color)
@@ -1432,6 +1928,70 @@ function Set-OrbTheme {
     }
 }
 
+function Restore-ClassicOrbTheme {
+    $OrbAtmosphereFill.Fill = $script:ClassicOrbVisuals.AtmosphereFill.Clone()
+    $OrbWaterFill.Fill = $script:ClassicOrbVisuals.WaterFill.Clone()
+    $OrbWaterGloss.Fill = $script:ClassicOrbVisuals.WaterGloss.Clone()
+    $OrbWaterSheen.Fill = $script:ClassicOrbVisuals.WaterSheen.Clone()
+    $OrbWaveBack.Stroke = $script:ClassicOrbVisuals.WaveBackStroke.Clone()
+    $OrbWaveBack.Fill = $script:ClassicOrbVisuals.WaveBackFill.Clone()
+    $OrbWaveShade.Stroke = $script:ClassicOrbVisuals.WaveShadeStroke.Clone()
+    $OrbWaveFront.Stroke = $script:ClassicOrbVisuals.WaveFrontStroke.Clone()
+    $OrbWaveFront.Fill = $script:ClassicOrbVisuals.WaveFrontFill.Clone()
+    $OrbPercentText.Foreground = $script:ClassicOrbVisuals.PercentForeground.Clone()
+    $OrbPercentText.Effect = $script:ClassicOrbVisuals.PercentEffect.Clone()
+}
+
+function Update-OrbStyleToggleVisual {
+    $isGradient = $script:OrbStyle -eq 'Gradient'
+    $ClassicStyleDot.Opacity = if ($isGradient) { 0.38 } else { 1.0 }
+    $GradientStyleDot.Opacity = if ($isGradient) { 1.0 } else { 0.38 }
+    $ClassicStyleDot.Stroke = New-Brush $(if ($isGradient) { '#42FFFFFF' } else { '#F2FFFFFF' })
+    $ClassicStyleDot.StrokeThickness = if ($isGradient) { 1.0 } else { 1.5 }
+    $GradientStyleDot.Stroke = New-Brush $(if ($isGradient) { '#F2FFFFFF' } else { '#42FFFFFF' })
+    $GradientStyleDot.StrokeThickness = if ($isGradient) { 1.5 } else { 1.0 }
+    $OrbStyleToggleButton.ToolTip = if ($isGradient) { '切换为原版蓝色' } else { '切换为渐变色' }
+}
+
+function Set-OrbStyleMode {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Classic', 'Gradient')]
+        [string]$Style,
+        [switch]$Persist
+    )
+
+    $script:OrbStyle = $Style
+    $level = if ($script:CurrentSnapshot) { [double]$script:CurrentSnapshot.Remaining } else { [double]$script:OrbWaterLevel }
+    $script:OrbWaterLevel = [Math]::Max(0.0, [Math]::Min(100.0, $level))
+    $script:OrbWaterTarget = $script:OrbWaterLevel
+    $script:OrbWaterTransitionActive = $false
+
+    if ($script:OrbStyle -eq 'Gradient') {
+        Set-OrbTheme $script:OrbWaterLevel
+    } else {
+        Restore-ClassicOrbTheme
+    }
+    Set-OrbWaterGeometry $script:OrbWaterLevel
+    Update-OrbStyleToggleVisual
+
+    if ($null -ne $waveTimer) {
+        $waveTimer.Interval = if ($script:OrbStyle -eq 'Gradient') {
+            [TimeSpan]::FromMilliseconds(50)
+        } else {
+            [TimeSpan]::FromMilliseconds(160)
+        }
+    }
+
+    if ($Persist) {
+        try {
+            Set-Content -LiteralPath (Join-Path $script:ScriptDir 'orb-style.txt') -Value $script:OrbStyle -Encoding ASCII
+        } catch {
+            Write-Diagnostic ('Unable to persist orb style: ' + $_.Exception.Message)
+        }
+    }
+}
+
 function Set-OrbWaterGeometry {
     param([double]$Remaining)
 
@@ -1452,37 +2012,59 @@ function Set-OrbWaterGeometry {
     }
 }
 
-function Update-Countdown {
-    if (-not $script:CurrentSnapshot -or -not $script:CurrentSnapshot.ResetAt) {
-        $ResetText.Text = '重置时间暂不可用'
-        return
+function Get-QuotaAccentColor {
+    param([double]$Remaining)
+    if ($Remaining -ge 25) { return '#0A84FF' }
+    if ($Remaining -ge 10) { return '#FF9F0A' }
+    return '#FF453A'
+}
+
+function Format-QuotaResetText {
+    param($Snapshot)
+    if (-not $Snapshot -or -not $Snapshot.ResetAt) {
+        return '重置时间暂不可用'
     }
 
-    $reset = [DateTimeOffset]$script:CurrentSnapshot.ResetAt
+    $reset = [DateTimeOffset]$Snapshot.ResetAt
     $remaining = $reset - [DateTimeOffset]::Now
     if ($remaining.TotalSeconds -le 0) {
-        $ResetText.Text = '额度周期正在刷新'
-        return
+        return '额度周期正在刷新'
     }
 
     $parts = New-Object System.Collections.Generic.List[string]
     if ($remaining.Days -gt 0) { $parts.Add(('{0}天' -f $remaining.Days)) }
     if ($remaining.Hours -gt 0 -or $remaining.Days -gt 0) { $parts.Add(('{0}小时' -f $remaining.Hours)) }
     $parts.Add(('{0}分钟' -f $remaining.Minutes))
-    $ResetText.Text = ('{0:MM月dd日 HH:mm} · {1}' -f $reset.LocalDateTime, ($parts -join ' '))
+    return ("{0:MM月dd日 HH:mm}`n剩余 {1}" -f $reset.LocalDateTime, ($parts -join ' '))
 }
 
-function Update-ProgressFill {
-    if (-not $script:CurrentSnapshot -or $ProgressTrack.ActualWidth -le 0) {
-        $CapacityFill.Width = 0
+function Update-Countdown {
+    $FiveHourResetText.Text = Format-QuotaResetText $script:FiveHourSnapshot
+    $WeeklyResetText.Text = Format-QuotaResetText $script:WeeklySnapshot
+}
+
+function Set-QuotaProgressFill {
+    param(
+        [Parameter(Mandatory = $true)]$Track,
+        [Parameter(Mandatory = $true)]$Fill,
+        $Snapshot
+    )
+
+    if (-not $Snapshot -or $Track.ActualWidth -le 0) {
+        $Fill.Width = 0
         return
     }
 
-    $fillWidth = $ProgressTrack.ActualWidth * ([double]$script:CurrentSnapshot.Remaining / 100.0)
+    $fillWidth = $Track.ActualWidth * ([double]$Snapshot.Remaining / 100.0)
     if ($fillWidth -gt 0) {
-        $fillWidth = [Math]::Max(12.0, $fillWidth)
+        $fillWidth = [Math]::Max(7.0, $fillWidth)
     }
-    $CapacityFill.Width = [Math]::Min($ProgressTrack.ActualWidth, $fillWidth)
+    $Fill.Width = [Math]::Min($Track.ActualWidth, $fillWidth)
+}
+
+function Update-ProgressFill {
+    Set-QuotaProgressFill -Track $ProgressTrack -Fill $CapacityFill -Snapshot $script:FiveHourSnapshot
+    Set-QuotaProgressFill -Track $WeeklyProgressTrack -Fill $WeeklyCapacityFill -Snapshot $script:WeeklySnapshot
 }
 
 function Update-OrbWaterLevel {
@@ -1570,42 +2152,53 @@ function Save-RateHistorySnapshot {
     }
 }
 
-function Apply-Snapshot {
-    param($Snapshot)
-    if (-not $Snapshot) { return }
+function Apply-RateWindows {
+    param(
+        $FiveHourSnapshot,
+        $WeeklySnapshot,
+        [bool]$FiveHourUsesWeeklyFallback = $false,
+        [switch]$SkipHistory
+    )
 
-    $script:CurrentSnapshot = $Snapshot
-    $remaining = [double]$Snapshot.Remaining
-    $used = [double]$Snapshot.UsedPercent
-
-    if ($remaining -ge 25) {
-        $accent = '#0A84FF'
-        $soft = '#260A84FF'
-        $badge = '#242A4E76'
-    } elseif ($remaining -ge 10) {
-        $accent = '#FF9F0A'
-        $soft = '#26FF9F0A'
-        $badge = '#332B210E'
-    } else {
-        $accent = '#FF453A'
-        $soft = '#26FF453A'
-        $badge = '#33321B1B'
+    if (-not $FiveHourSnapshot -and -not $WeeklySnapshot) { return }
+    if (-not $WeeklySnapshot) { $WeeklySnapshot = $FiveHourSnapshot }
+    if (-not $FiveHourSnapshot) {
+        $FiveHourSnapshot = $WeeklySnapshot
+        $FiveHourUsesWeeklyFallback = $true
     }
 
+    $script:CurrentSnapshot = $FiveHourSnapshot
+    $script:FiveHourSnapshot = $FiveHourSnapshot
+    $script:WeeklySnapshot = $WeeklySnapshot
+    $script:FiveHourUsesWeeklyFallback = $FiveHourUsesWeeklyFallback
+
+    $remaining = [double]$FiveHourSnapshot.Remaining
+    $weeklyRemaining = [double]$WeeklySnapshot.Remaining
+    $accent = Get-QuotaAccentColor $remaining
+    $weeklyAccent = Get-QuotaAccentColor $weeklyRemaining
+    $soft = if ($remaining -ge 25) { '#260A84FF' } elseif ($remaining -ge 10) { '#26FF9F0A' } else { '#26FF453A' }
+    $badge = if ($remaining -ge 25) { '#242A4E76' } elseif ($remaining -ge 10) { '#332B210E' } else { '#33321B1B' }
+
     $accentBrush = New-Brush $accent
+    $weeklyAccentBrush = New-Brush $weeklyAccent
     $PercentText.Text = ('{0:0}%' -f $remaining)
+    $WeeklyPercentText.Text = ('{0:0}%' -f $weeklyRemaining)
     $OrbPercentText.Text = ('{0:0}%' -f $remaining)
     $OrbPercentWaterText.Text = $OrbPercentText.Text
     Update-OrbWaterLevel $remaining
     $CapacityFill.Background = $accentBrush
+    $WeeklyCapacityFill.Background = $weeklyAccentBrush
     $StatusDot.Fill = $accentBrush
     $StatusHalo.Background = New-Brush $soft
     $SourceBadge.Background = New-Brush $badge
-    $UsedText.Text = ('已用 {0:0}% · {1}' -f $used, $(if ($Snapshot.PlanType) { $Snapshot.PlanType.ToUpperInvariant() } else { 'CODEX' }))
-    $UpdatedText.Text = ('{0:HH:mm:ss}' -f $Snapshot.ObservedAt.LocalDateTime)
+    $planLabel = if ($FiveHourSnapshot.PlanType) { $FiveHourSnapshot.PlanType.ToUpperInvariant() } else { 'CODEX' }
+    $FiveHourUsedText.Text = ('已用 {0:0}% · {1}' -f ([double]$FiveHourSnapshot.UsedPercent), $planLabel)
+    $WeeklyUsedText.Text = ('已用 {0:0}% · {1}' -f ([double]$WeeklySnapshot.UsedPercent), $planLabel)
+    $FiveHourFallbackText.Visibility = if ($FiveHourUsesWeeklyFallback) { 'Visible' } else { 'Collapsed' }
+    $UpdatedText.Text = ('{0:HH:mm:ss}' -f $FiveHourSnapshot.ObservedAt.LocalDateTime)
     Update-ProgressFill
 
-    if ($Snapshot.Source -eq 'direct') {
+    if ($FiveHourSnapshot.Source -eq 'direct') {
         $SourceText.Text = 'LIVE API'
         $SourceText.Foreground = $accentBrush
     } else {
@@ -1614,23 +2207,42 @@ function Apply-Snapshot {
     }
 
     Update-Countdown
-    Save-RateHistorySnapshot $Snapshot
+    if (-not $SkipHistory) {
+        # Preserve the historical weekly series even after the orb starts using
+        # the restored five-hour window.
+        Save-RateHistorySnapshot $WeeklySnapshot
+    }
 
     if ($script:AnalyticsSnapshot) {
         Apply-AnalyticsSnapshot $script:AnalyticsSnapshot
     }
 }
 
+function Apply-Snapshot {
+    param($Snapshot)
+    if (-not $Snapshot) { return }
+    Apply-RateWindows -FiveHourSnapshot $Snapshot -WeeklySnapshot $Snapshot -FiveHourUsesWeeklyFallback $true
+}
+
 function Apply-EmptyState {
     param([string]$Message)
+    $script:CurrentSnapshot = $null
+    $script:FiveHourSnapshot = $null
+    $script:WeeklySnapshot = $null
+    $script:FiveHourUsesWeeklyFallback = $true
     $PercentText.Text = '--%'
+    $WeeklyPercentText.Text = '--%'
     $OrbPercentText.Text = '--%'
     $OrbPercentWaterText.Text = '--%'
     Update-OrbWaterLevel 0
     $CapacityFill.Width = 0
+    $WeeklyCapacityFill.Width = 0
     $SourceText.Text = 'WAITING'
-    $UsedText.Text = $Message
-    $ResetText.Text = '启动 Codex 完成一次响应后自动出现'
+    $FiveHourUsedText.Text = $Message
+    $WeeklyUsedText.Text = $Message
+    $FiveHourFallbackText.Visibility = 'Visible'
+    $FiveHourResetText.Text = '等待 5h 或周额度快照'
+    $WeeklyResetText.Text = '启动 Codex 后自动出现'
     $UpdatedText.Text = '--:--'
 }
 
@@ -1653,11 +2265,49 @@ function Get-AnalyticsLabel {
     }
 }
 
+function Get-ToolCategoryLabel {
+    param([string]$Name)
+    switch ($Name) {
+        'command' { return '命令执行' }
+        'file' { return '文件修改' }
+        'web' { return '网页查询' }
+        'connector' { return 'MCP / 连接器' }
+        'agent' { return 'Agent 协作' }
+        'document' { return '文档与数据' }
+        'media' { return '图片与媒体' }
+        'workflow' { return '工作流控制' }
+        default { return '其他工具' }
+    }
+}
+
+function Get-SkillStatusLabel {
+    param([string]$Status)
+    switch ($Status) {
+        'frequent' { return '常用' }
+        'occasional' { return '偶尔使用' }
+        'installed_only' { return '仅安装' }
+        default { return '未使用' }
+    }
+}
+
+function Format-AnalyticsLastUsed {
+    param($Value)
+    if (-not $Value) { return '暂无记录' }
+    try {
+        $day = [DateTime]::ParseExact([string]$Value, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        if ($day.Date -eq (Get-Date).Date) { return '今天' }
+        if ($day.Date -eq (Get-Date).Date.AddDays(-1)) { return '昨天' }
+        return $day.ToString('MM/dd')
+    } catch {
+        return [string]$Value
+    }
+}
+
 function Render-UsageRows {
     param(
         $Panel,
         $Rows,
-        [ValidateSet('daily', 'skill', 'chain', 'agent')][string]$Mode
+        [ValidateSet('daily', 'skill', 'chain', 'agent', 'tool')][string]$Mode
     )
 
     $Panel.Children.Clear()
@@ -1675,9 +2325,9 @@ function Render-UsageRows {
     $palette = @('#0A84FF', '#64D2FF', '#5E5CE6', '#BF5AF2', '#30D158', '#FFD60A', '#FF9F0A', '#FF453A')
     $index = 0
     foreach ($item in $items) {
-        $stackedLayout = $Mode -in @('skill', 'chain')
+        $stackedLayout = $Mode -in @('skill', 'chain', 'agent', 'tool')
         $row = [System.Windows.Controls.Grid]::new()
-        $row.Height = if ($Mode -eq 'skill') { 60 } elseif ($Mode -eq 'chain') { 50 } else { 36 }
+        $row.Height = if ($Mode -eq 'skill') { 60 } elseif ($Mode -in @('chain', 'agent', 'tool')) { 52 } else { 36 }
         $row.Margin = if ($stackedLayout) { '0,0,0,4' } else { '0,0,0,2' }
         if ($stackedLayout) {
             $topRow = [System.Windows.Controls.RowDefinition]::new()
@@ -1709,6 +2359,10 @@ function Render-UsageRows {
             } catch {
                 [string]$item.date
             }
+        } elseif ($Mode -eq 'agent' -and $item.kind) {
+            ('{0} · {1}' -f $(if ([string]$item.kind -eq 'ROOT') { '主' } else { '子' }), ([string]$item.name))
+        } elseif ($Mode -eq 'tool') {
+            Get-ToolCategoryLabel ([string]$item.category)
         } else {
             Get-AnalyticsLabel ([string]$item.name)
         }
@@ -1716,11 +2370,12 @@ function Render-UsageRows {
         if ($Mode -eq 'skill') {
             $label = [System.Windows.Controls.StackPanel]::new()
             $label.VerticalAlignment = 'Center'
-            $label.ToolTip = ('主归因 {0} · 关联 {1} · 参与 {2} Turn · 路由 {3} Turn' -f `
-                (Format-TokenCount ([long]$item.tokens)),
+            $scopeText = if ($item.scope) { [string]$item.scope } else { 'OTHER' }
+            $label.ToolTip = ('参与 {0} · 主归因 {1} · {2} Turn · {3}' -f `
                 (Format-TokenCount ([long]$item.associatedTokens)),
+                (Format-TokenCount ([long]$item.primaryTokens)),
                 ([long]$item.turns),
-                ([long]$item.routerTurns))
+                $scopeText)
 
             $skillName = [System.Windows.Controls.TextBlock]::new()
             $skillName.Text = $labelText
@@ -1731,15 +2386,59 @@ function Render-UsageRows {
 
             $skillDetail = [System.Windows.Controls.TextBlock]::new()
             $skillDetail.Text = if ([long]$item.turns -gt 0) {
-                '关联 {0} · {1}T' -f (Format-TokenCount ([long]$item.associatedTokens)), ([long]$item.turns)
+                '{0} · 使用 {1} 次 · 最近 {2}' -f (Get-SkillStatusLabel ([string]$item.status)), ([long]$item.turns), (Format-AnalyticsLastUsed $item.lastUsed)
             } else {
-                '未参与 · 0T'
+                '{0} · {1}{2}' -f (Get-SkillStatusLabel ([string]$item.status)), $scopeText, $(if ($item.available) { ' · 当前可用' } else { ' · 未公布' })
             }
             $skillDetail.Foreground = New-Brush '#78FFFFFF'
             $skillDetail.FontSize = 9
             $skillDetail.Margin = '0,1,0,0'
             [void]$label.Children.Add($skillName)
             [void]$label.Children.Add($skillDetail)
+        } elseif ($Mode -eq 'agent') {
+            $label = [System.Windows.Controls.StackPanel]::new()
+            $label.VerticalAlignment = 'Center'
+            $label.ToolTip = ('{0} Turn · {1} 会话 · 模型 {2} · effort {3}' -f `
+                ([long]$item.turns),
+                ([long]$item.sessions),
+                (@($item.models) -join ', '),
+                (@($item.efforts) -join ', '))
+
+            $agentName = [System.Windows.Controls.TextBlock]::new()
+            $agentName.Text = $labelText
+            $agentName.Foreground = New-Brush '#D1D1D6'
+            $agentName.FontSize = 11
+            $agentName.FontWeight = 'SemiBold'
+            $agentName.TextTrimming = 'CharacterEllipsis'
+
+            $agentDetail = [System.Windows.Controls.TextBlock]::new()
+            $agentDetail.Text = ('完成 {0}/{1} · Tool {2} · 最近 {3}' -f `
+                ([long]$item.completedTurns), ([long]$item.turns), ([long]$item.toolCalls), (Format-AnalyticsLastUsed $item.lastUsed))
+            $agentDetail.Foreground = New-Brush $(if ([long]$item.toolFailures -gt 0) { '#FFFF9F0A' } else { '#78FFFFFF' })
+            $agentDetail.FontSize = 9
+            $agentDetail.Margin = '0,1,0,0'
+            [void]$label.Children.Add($agentName)
+            [void]$label.Children.Add($agentDetail)
+        } elseif ($Mode -eq 'tool') {
+            $label = [System.Windows.Controls.StackPanel]::new()
+            $label.VerticalAlignment = 'Center'
+            $label.ToolTip = (@($item.tools) -join ', ')
+
+            $toolName = [System.Windows.Controls.TextBlock]::new()
+            $toolName.Text = $labelText
+            $toolName.Foreground = New-Brush '#D1D1D6'
+            $toolName.FontSize = 11
+            $toolName.FontWeight = 'SemiBold'
+            $toolName.TextTrimming = 'CharacterEllipsis'
+
+            $toolDetail = [System.Windows.Controls.TextBlock]::new()
+            $toolDetail.Text = ('调用 {0} · 失败 {1} · 最近 {2}' -f `
+                ([long]$item.calls), ([long]$item.failures), (Format-AnalyticsLastUsed $item.lastUsed))
+            $toolDetail.Foreground = New-Brush $(if ([long]$item.failures -gt 0) { '#FFFF9F0A' } else { '#78FFFFFF' })
+            $toolDetail.FontSize = 9
+            $toolDetail.Margin = '0,1,0,0'
+            [void]$label.Children.Add($toolName)
+            [void]$label.Children.Add($toolDetail)
         } else {
             $label = [System.Windows.Controls.TextBlock]::new()
             $label.Text = $labelText
@@ -1785,7 +2484,7 @@ function Render-UsageRows {
         }
 
         $value = [System.Windows.Controls.TextBlock]::new()
-        $value.Text = Format-TokenCount ([long]$item.tokens)
+        $value.Text = if ($Mode -eq 'tool') { '{0:N0} 次' -f ([long]$item.calls) } else { Format-TokenCount ([long]$item.tokens) }
         $value.Foreground = New-Brush '#D0FFFFFF'
         $value.FontSize = if ($stackedLayout) { 11 } else { 10 }
         $value.HorizontalAlignment = 'Right'
@@ -1880,16 +2579,17 @@ function Set-SkillView {
     }
 
     if ($Name -eq 'chain') {
-        $SkillSectionTitle.Text = 'SKILL · 前后路由逻辑'
-        $SkillHintText.Text = '按证据顺序记录“前置 Skill → 最终 Skill”；每条链的 Token 只计一次。'
+        $SkillSectionTitle.Text = 'SKILL · 多 SKILL 调用链'
+        $SkillHintText.Text = '按本地载入证据显示 Skill 组合顺序；每条链内 Token 只计一次。'
     } elseif ($script:AnalyticsSnapshot) {
-        $SkillSectionTitle.Text = 'SKILL · 主归因 TOKEN'
+        $SkillSectionTitle.Text = 'SKILL · 使用情况'
         $installedCount = [long]$script:AnalyticsSnapshot.installedSkillCount
+        $availableCount = [long]$script:AnalyticsSnapshot.availableSkillCount
         $unattributed = [double]$script:AnalyticsSnapshot.unattributedSkillPercent
-        $SkillHintText.Text = ('已安装 {0} 个 · 未归因 {1:0.0}% · 关联 Token 不可相加。' -f $installedCount, $unattributed)
+        $SkillHintText.Text = ('已安装 {0} · 当前公布 {1} · 未归因 {2:0.0}% · 参与 Token 会重复。' -f $installedCount, $availableCount, $unattributed)
     } else {
-        $SkillSectionTitle.Text = 'SKILL · 主归因 TOKEN'
-        $SkillHintText.Text = '主归因只计最终 Skill；关联 Token 不可相加。'
+        $SkillSectionTitle.Text = 'SKILL · 使用情况'
+        $SkillHintText.Text = '参与 Token 会重复归因；归因覆盖率仍按每个 Turn 只计一次。'
     }
 }
 
@@ -1900,7 +2600,7 @@ function Apply-AnalyticsSnapshot {
     Write-Diagnostic 'Applying analytics snapshot.'
     $dailyView = Get-DisplayDailyUsage $Snapshot
     $SevenDayTotalText.Text = Format-TokenCount ([long]$dailyView.Total)
-    $AnalyticsSourceText.Text = $dailyView.Source
+    $AnalyticsSourceText.Text = ($dailyView.Source + ' · 0 TOKEN')
     $DailySourceText.Text = if ($dailyView.Source -eq 'ACCOUNT API') { '当前账号每日桶（兜底）' } else { '本机全部账号会话' }
     Render-UsageRows -Panel $DailyRowsPanel -Rows $dailyView.Rows -Mode daily
     Write-Diagnostic 'Rendered daily analytics rows.'
@@ -1908,14 +2608,45 @@ function Apply-AnalyticsSnapshot {
     Write-Diagnostic 'Rendered skill analytics rows.'
     Render-UsageRows -Panel $SkillChainRowsPanel -Rows @($Snapshot.skillChains) -Mode chain
     Write-Diagnostic 'Rendered skill route chains.'
-    Render-UsageRows -Panel $AgentRowsPanel -Rows @($Snapshot.agents) -Mode agent
+    Render-UsageRows -Panel $AgentRowsPanel -Rows @($Snapshot.agentBreakdown) -Mode agent
     Write-Diagnostic 'Rendered agent analytics rows.'
+    Render-UsageRows -Panel $ToolRowsPanel -Rows @($Snapshot.tools.rows) -Mode tool
+    Write-Diagnostic 'Rendered Tool analytics rows.'
 
-    $SkillPrimaryButton.Content = ('{0} Skill' -f ([long]$Snapshot.installedSkillCount))
-    $SkillCoverageText.Text = ('{0} Skills · 覆盖 {1:0.0}%' -f ([long]$Snapshot.installedSkillCount), ([double]$Snapshot.skillCoveragePercent))
+    $SkillPrimaryButton.Content = ('{0} 可用' -f ([long]$Snapshot.availableSkillCount))
+    $SkillCoverageText.Text = ('归因覆盖 {0:0.0}%' -f ([double]$Snapshot.skillCoveragePercent))
+    $rootAgent = @($Snapshot.agentSummary | Where-Object { [string]$_.name -eq 'ROOT' } | Select-Object -First 1)
+    $subAgent = @($Snapshot.agentSummary | Where-Object { [string]$_.name -eq 'SUBAGENT' } | Select-Object -First 1)
+    $AgentSummaryText.Text = ('主 {0:0.0}% · 子 {1:0.0}%' -f `
+        $(if ($rootAgent.Count) { [double]$rootAgent[0].sharePercent } else { 0.0 }),
+        $(if ($subAgent.Count) { [double]$subAgent[0].sharePercent } else { 0.0 }))
+    $ToolSummaryText.Text = ('调用 {0} · 失败 {1}' -f `
+        ([long]$Snapshot.tools.calls),
+        ([long]$Snapshot.tools.failures))
+    $ToolHintText.Text = ('MCP {0}/{1} · 插件 {2}；纯本地读取，不调用模型。' -f `
+        ([long]$Snapshot.tools.enabledMcpServers),
+        ([long]$Snapshot.tools.configuredMcpServers),
+        ([long]$Snapshot.tools.enabledPlugins))
+
+    $WorkflowHintsPanel.Children.Clear()
+    $workflowHints = @($Snapshot.workflowHints | Select-Object -First 3)
+    if ($workflowHints.Count -eq 0) {
+        $workflowHints = @('当前没有需要处理的工作流提醒。')
+    }
+    foreach ($hintText in $workflowHints) {
+        $hint = [System.Windows.Controls.TextBlock]::new()
+        $hint.Text = ('• ' + [string]$hintText)
+        $hint.Foreground = New-Brush '#9FFFFFFF'
+        $hint.FontSize = 9
+        $hint.TextWrapping = 'Wrap'
+        $hint.Margin = '0,1,0,0'
+        [void]$WorkflowHintsPanel.Children.Add($hint)
+    }
     Set-SkillView $script:ActiveSkillView
-    $OfficialRateText.Text = if ($script:CurrentSnapshot) {
-        '官方额度已用 {0:0}%' -f ([double]$script:CurrentSnapshot.UsedPercent)
+    $OfficialRateText.Text = if ($script:FiveHourSnapshot -and $script:WeeklySnapshot) {
+        '官方额度：5h 已用 {0:0}% · 1周已用 {1:0}%' -f
+            ([double]$script:FiveHourSnapshot.UsedPercent),
+            ([double]$script:WeeklySnapshot.UsedPercent)
     } else {
         '官方额度暂不可用'
     }
@@ -1931,22 +2662,24 @@ function Apply-AnalyticsSnapshot {
     }
 
     $generated = try { [DateTimeOffset]::Parse([string]$Snapshot.generatedAt).LocalDateTime.ToString('HH:mm:ss') } catch { '--:--' }
-    $AnalyticsStatusText.Text = ('本地索引 {0} 个文件 · 缓存命中 {1} · {2}' -f $Snapshot.scannedFiles, $Snapshot.cacheHits, $generated)
+    $AnalyticsStatusText.Text = ('本地索引 {0} 个文件 · 0 Token · {1}' -f $Snapshot.scannedFiles, $generated)
     Write-Diagnostic 'Analytics snapshot applied.'
 }
 
 function Set-AnalyticsTab {
-    param([ValidateSet('daily', 'skill', 'agent')][string]$Name)
+    param([ValidateSet('daily', 'skill', 'agent', 'tool')][string]$Name)
     $script:ActiveAnalyticsTab = $Name
     $DailyPanel.Visibility = if ($Name -eq 'daily') { 'Visible' } else { 'Collapsed' }
     $SkillPanel.Visibility = if ($Name -eq 'skill') { 'Visible' } else { 'Collapsed' }
     $AgentPanel.Visibility = if ($Name -eq 'agent') { 'Visible' } else { 'Collapsed' }
+    $ToolPanel.Visibility = if ($Name -eq 'tool') { 'Visible' } else { 'Collapsed' }
     if ($Name -eq 'skill') { Set-SkillView $script:ActiveSkillView }
 
     foreach ($entry in @(
         [pscustomobject]@{ Name = 'daily'; Button = $DailyTabButton },
         [pscustomobject]@{ Name = 'skill'; Button = $SkillTabButton },
-        [pscustomobject]@{ Name = 'agent'; Button = $AgentTabButton }
+        [pscustomobject]@{ Name = 'agent'; Button = $AgentTabButton },
+        [pscustomobject]@{ Name = 'tool'; Button = $ToolTabButton }
     )) {
         if ($entry.Name -eq $Name) {
             $entry.Button.Background = New-Brush '#467ECDF7'
@@ -2016,7 +2749,7 @@ function Show-CapacityView {
     $AnalyticsBorder.Visibility = 'Collapsed'
     $ResetCreditsBorder.Visibility = 'Collapsed'
     $GlowBorder.Visibility = 'Visible'
-    Resize-WindowAroundCenter -Width 380 -Height 362
+    Resize-WindowAroundCenter -Width 420 -Height 438
     Update-ProgressFill
 }
 
@@ -2164,6 +2897,9 @@ function Start-DirectRefreshAsync {
         $worker.StartInfo = $workerInfo
         [void]$worker.Start()
         $script:DirectWorkerProcess = $worker
+        $script:DirectWorkerStartedAt = [DateTime]::UtcNow
+        $script:DirectWorkerOutputTask = $worker.StandardOutput.ReadToEndAsync()
+        $script:DirectWorkerErrorTask = $worker.StandardError.ReadToEndAsync()
         $script:PendingDirectRefresh = $false
         $RefreshButton.IsEnabled = $false
         $RefreshButton.Content = '···'
@@ -2176,29 +2912,44 @@ function Start-DirectRefreshAsync {
 
 function Complete-DirectRefreshIfReady {
     $worker = $script:DirectWorkerProcess
-    if (-not $worker -or -not $worker.HasExited) {
+    if (-not $worker) {
+        return
+    }
+    if (-not $worker.HasExited) {
+        if ($script:DirectWorkerStartedAt -and ([DateTime]::UtcNow - $script:DirectWorkerStartedAt).TotalSeconds -ge 15) {
+            Write-Diagnostic 'Direct worker exceeded 15 seconds and was stopped.'
+            $runAgain = $script:PendingDirectRefresh
+            Stop-OwnedProcess $worker
+            $script:DirectWorkerProcess = $null
+            $script:DirectWorkerStartedAt = $null
+            $script:DirectWorkerOutputTask = $null
+            $script:DirectWorkerErrorTask = $null
+            $script:PendingDirectRefresh = $false
+            $RefreshButton.Content = '↻'
+            $RefreshButton.IsEnabled = $true
+            $AnalyticsRefreshButton.Content = '↻'
+            $AnalyticsRefreshButton.IsEnabled = $true
+            if ($runAgain) { Start-DirectRefreshAsync }
+        }
         return
     }
 
     try {
-        $output = $worker.StandardOutput.ReadToEnd().Trim()
-        $errorText = $worker.StandardError.ReadToEnd().Trim()
+        $output = ([string]$script:DirectWorkerOutputTask.Result).Trim()
+        $errorText = ([string]$script:DirectWorkerErrorTask.Result).Trim()
         if ($worker.ExitCode -eq 0 -and $output) {
             $wire = $output | ConvertFrom-Json
             $script:AccountUsage = if ($wire.Usage) { $wire.Usage } else { $null }
-            if ($wire.Rate) {
-                $rateWire = $wire.Rate
-                $snapshot = [pscustomobject]@{
-                    Source        = 'direct'
-                    UsedPercent   = [double]$rateWire.UsedPercent
-                    Remaining     = [double]$rateWire.Remaining
-                    ResetAt       = if ($null -ne $rateWire.ResetEpoch) { [DateTimeOffset]::FromUnixTimeSeconds([long]$rateWire.ResetEpoch).ToLocalTime() } else { $null }
-                    WindowMinutes = if ($null -ne $rateWire.WindowMinutes) { [long]$rateWire.WindowMinutes } else { $null }
-                    PlanType      = [string]$rateWire.PlanType
-                    LimitId       = [string]$rateWire.LimitId
-                    ObservedAt    = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$rateWire.ObservedEpoch).ToLocalTime()
-                }
-                Apply-Snapshot $snapshot
+            if ($wire.Rates -and $wire.Rates.FiveHour -and $wire.Rates.Weekly) {
+                $fiveHourSnapshot = ConvertFrom-RateWire $wire.Rates.FiveHour
+                $weeklySnapshot = ConvertFrom-RateWire $wire.Rates.Weekly
+                Apply-RateWindows `
+                    -FiveHourSnapshot $fiveHourSnapshot `
+                    -WeeklySnapshot $weeklySnapshot `
+                    -FiveHourUsesWeeklyFallback ([bool]$wire.Rates.FiveHourUsesWeeklyFallback)
+            } elseif ($wire.Rate) {
+                # Compatibility path for a worker from an older installed copy.
+                Apply-Snapshot (ConvertFrom-RateWire $wire.Rate)
             } elseif (-not $script:CurrentSnapshot) {
                 Apply-EmptyState '账户接口不可用；启动 Codex 完成响应后读取事件快照'
             }
@@ -2221,6 +2972,9 @@ function Complete-DirectRefreshIfReady {
         $runAgain = $script:PendingDirectRefresh
         $worker.Dispose()
         $script:DirectWorkerProcess = $null
+        $script:DirectWorkerStartedAt = $null
+        $script:DirectWorkerOutputTask = $null
+        $script:DirectWorkerErrorTask = $null
         $script:PendingDirectRefresh = $false
         $RefreshButton.Content = '↻'
         $RefreshButton.IsEnabled = $true
@@ -2305,41 +3059,69 @@ function Complete-ResetCreditsRefreshIfReady {
 
 function Start-AnalyticsRefreshAsync {
     if ($script:IsAnalyticsRefreshing) { return }
-    $script:IsAnalyticsRefreshing = $true
 
     try {
-        if (-not (Test-Path -LiteralPath $script:UsageAnalyticsPath)) {
-            throw '未找到 UsageAnalytics.py。'
+        if ($script:AnalyticsWorkerProcess) {
+            if (-not $script:AnalyticsWorkerProcess.HasExited) { return }
+            $script:AnalyticsWorkerProcess.Dispose()
+            $script:AnalyticsWorkerProcess = $null
         }
-        $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
-        if (-not $pythonCommand) { $pythonCommand = Get-Command python -ErrorAction SilentlyContinue }
-        if (-not $pythonCommand -or -not $pythonCommand.Source) { throw '未找到 Python。' }
-
-        $arguments = New-Object System.Collections.Generic.List[string]
-        $arguments.Add($script:UsageAnalyticsPath)
-        foreach ($codexHome in (Get-CodexHomeCandidates)) {
-            $arguments.Add('--codex-home')
-            $arguments.Add([string]$codexHome)
-        }
-        if ($arguments.Count -le 1) { throw '未找到 Codex 本地目录。' }
-        $userSkillRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.agents\skills'
-        if (Test-Path -LiteralPath $userSkillRoot) {
-            $arguments.Add('--skill-root')
-            $arguments.Add($userSkillRoot)
-        }
-        $arguments.Add('--cache')
-        $arguments.Add($script:UsageCachePath)
-        $arguments.Add('--rate-history')
-        $arguments.Add($script:RateHistoryPath)
-        $arguments.Add('--days')
-        $arguments.Add('7')
 
         $AnalyticsRefreshButton.IsEnabled = $false
         $AnalyticsRefreshButton.Content = '···'
         $AnalyticsStatusText.Text = '正在增量汇总本地会话…'
-        $output = & $pythonCommand.Source @arguments
-        if ($LASTEXITCODE -ne 0 -or -not $output) { throw '统计进程未返回数据。' }
-        $snapshot = ($output -join "`n") | ConvertFrom-Json
+
+        $workerInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $workerInfo.FileName = (Get-Command powershell.exe).Source
+        $workerInfo.Arguments = ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -AnalyticsWorker' -f $script:ScriptPath)
+        $workerInfo.UseShellExecute = $false
+        $workerInfo.CreateNoWindow = $true
+        $workerInfo.RedirectStandardOutput = $true
+        $workerInfo.RedirectStandardError = $true
+
+        $worker = New-Object System.Diagnostics.Process
+        $worker.StartInfo = $workerInfo
+        [void]$worker.Start()
+        $script:AnalyticsWorkerProcess = $worker
+        $script:AnalyticsWorkerStartedAt = [DateTime]::UtcNow
+        $script:AnalyticsWorkerOutputTask = $worker.StandardOutput.ReadToEndAsync()
+        $script:AnalyticsWorkerErrorTask = $worker.StandardError.ReadToEndAsync()
+        $script:IsAnalyticsRefreshing = $true
+    } catch {
+        $script:IsAnalyticsRefreshing = $false
+        $AnalyticsStatusText.Text = '本地统计失败：' + $_.Exception.Message
+        Write-Diagnostic ('Analytics refresh failed: ' + $_.Exception.Message)
+        $AnalyticsRefreshButton.IsEnabled = $true
+        $AnalyticsRefreshButton.Content = '↻'
+    }
+}
+
+function Complete-AnalyticsRefreshIfReady {
+    $worker = $script:AnalyticsWorkerProcess
+    if (-not $worker) { return }
+    if (-not $worker.HasExited) {
+        if ($script:AnalyticsWorkerStartedAt -and ([DateTime]::UtcNow - $script:AnalyticsWorkerStartedAt).TotalSeconds -ge 120) {
+            Stop-OwnedProcess $worker
+            $script:AnalyticsWorkerProcess = $null
+            $script:AnalyticsWorkerStartedAt = $null
+            $script:AnalyticsWorkerOutputTask = $null
+            $script:AnalyticsWorkerErrorTask = $null
+            $script:IsAnalyticsRefreshing = $false
+            $AnalyticsStatusText.Text = '本地统计超时，请稍后重试'
+            $AnalyticsRefreshButton.IsEnabled = $true
+            $AnalyticsRefreshButton.Content = '↻'
+        }
+        return
+    }
+
+    try {
+        $output = ([string]$script:AnalyticsWorkerOutputTask.Result).Trim()
+        $errorText = ([string]$script:AnalyticsWorkerErrorTask.Result).Trim()
+        if ($worker.ExitCode -ne 0 -or -not $output) {
+            if ($errorText) { throw $errorText }
+            throw '统计进程未返回数据。'
+        }
+        $snapshot = $output | ConvertFrom-Json
         if ($snapshot.PSObject.Properties.Name -contains 'error' -and $snapshot.error) { throw [string]$snapshot.error }
         $script:AnalyticsSnapshot = $snapshot
         Apply-AnalyticsSnapshot $snapshot
@@ -2347,9 +3129,14 @@ function Start-AnalyticsRefreshAsync {
         $AnalyticsStatusText.Text = '本地统计失败：' + $_.Exception.Message
         Write-Diagnostic ('Analytics refresh failed: ' + $_.Exception.Message)
     } finally {
+        $worker.Dispose()
+        $script:AnalyticsWorkerProcess = $null
+        $script:AnalyticsWorkerStartedAt = $null
+        $script:AnalyticsWorkerOutputTask = $null
+        $script:AnalyticsWorkerErrorTask = $null
+        $script:IsAnalyticsRefreshing = $false
         $AnalyticsRefreshButton.IsEnabled = $true
         $AnalyticsRefreshButton.Content = '↻'
-        $script:IsAnalyticsRefreshing = $false
     }
 }
 
@@ -2378,9 +3165,12 @@ function Refresh-Data {
         if ($TryDirect) {
             try {
                 Write-Diagnostic 'Reading account/rateLimits/read.'
-                $direct = Read-RateLimitFromAppServer
+                $direct = Read-RateWindowsFromAppServer
                 if ($direct) {
-                    Apply-Snapshot $direct
+                    Apply-RateWindows `
+                        -FiveHourSnapshot $direct.FiveHour `
+                        -WeeklySnapshot $direct.Weekly `
+                        -FiveHourUsesWeeklyFallback ([bool]$direct.FiveHourUsesWeeklyFallback)
                     return
                 }
             } catch {
@@ -2388,7 +3178,9 @@ function Refresh-Data {
             }
         }
 
-        $snapshot = Read-RateLimitFromSessionEvents
+        # The UI only reads the small widget-owned history cache. Session JSONL
+        # parsing happens in DirectWorker so it cannot block WPF input/rendering.
+        $snapshot = Read-RateLimitFromHistory
         if ($snapshot) {
             Apply-Snapshot $snapshot
         } elseif (-not $script:CurrentSnapshot) {
@@ -2446,7 +3238,8 @@ function Restore-WindowPosition {
 }
 
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
-$notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
+$script:TrayIconResource = New-QuotaTrayIconResource
+$notifyIcon.Icon = $script:TrayIconResource
 $notifyIcon.Text = 'Codex Quota Orb'
 $notifyIcon.Visible = $true
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -2509,9 +3302,14 @@ $window.Add_MouseLeftButtonDown({
 })
 
 $ProgressTrack.Add_SizeChanged({ Update-ProgressFill })
+$WeeklyProgressTrack.Add_SizeChanged({ Update-ProgressFill })
 
 $AnalyticsButton.Add_Click({ Show-AnalyticsView })
 $ResetCreditsButton.Add_Click({ Show-ResetCreditsView })
+$OrbStyleToggleButton.Add_Click({
+    $nextStyle = if ($script:OrbStyle -eq 'Gradient') { 'Classic' } else { 'Gradient' }
+    Set-OrbStyleMode -Style $nextStyle -Persist
+})
 $RefreshButton.Add_Click({
     Refresh-Data -TryDirect $false
     Start-DirectRefreshAsync
@@ -2565,6 +3363,7 @@ $AnalyticsCloseButton.Add_Click({
 $DailyTabButton.Add_Click({ Set-AnalyticsTab 'daily' })
 $SkillTabButton.Add_Click({ Set-AnalyticsTab 'skill' })
 $AgentTabButton.Add_Click({ Set-AnalyticsTab 'agent' })
+$ToolTabButton.Add_Click({ Set-AnalyticsTab 'tool' })
 $SkillPrimaryButton.Add_Click({ Set-SkillView 'primary' })
 $SkillChainButton.Add_Click({ Set-SkillView 'chain' })
 $ResetCreditsBackButton.Add_Click({ Show-CapacityView })
@@ -2592,6 +3391,12 @@ $resetCreditsWorkerTimer.Add_Tick({
     Complete-ResetCreditsRefreshIfReady
 })
 
+$analyticsWorkerTimer = New-Object System.Windows.Threading.DispatcherTimer
+$analyticsWorkerTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$analyticsWorkerTimer.Add_Tick({
+    Complete-AnalyticsRefreshIfReady
+})
+
 $eventTimer = New-Object System.Windows.Threading.DispatcherTimer
 $eventTimer.Interval = [TimeSpan]::FromSeconds(4)
 $eventTimer.Add_Tick({
@@ -2600,10 +3405,9 @@ $eventTimer.Add_Tick({
         if ($latest -and ($latest.FullName -ne $script:LastRolloutPath -or $latest.LastWriteTimeUtc.Ticks -ne $script:LastRolloutWriteTicks)) {
             $script:LastRolloutPath = $latest.FullName
             $script:LastRolloutWriteTicks = $latest.LastWriteTimeUtc.Ticks
-            $snapshot = Read-RateLimitFromSessionEvents
-            if ($snapshot -and (-not $script:CurrentSnapshot -or $snapshot.ObservedAt -gt $script:CurrentSnapshot.ObservedAt)) {
-                Apply-Snapshot $snapshot
-            }
+            # Refresh in a child process. Large JSONL records must never be read on
+            # the UI dispatcher, otherwise even a simple orb click can hang Windows.
+            Start-DirectRefreshAsync
             if ($AnalyticsBorder.Visibility -eq [System.Windows.Visibility]::Visible) {
                 Start-AnalyticsRefreshAsync
             }
@@ -2611,6 +3415,14 @@ $eventTimer.Add_Tick({
     } catch {
         Write-Diagnostic ('Event refresh failed: ' + $_.Exception.Message)
     }
+})
+
+$periodicRefreshTimer = New-Object System.Windows.Threading.DispatcherTimer
+$periodicRefreshTimer.Interval = [TimeSpan]::FromMinutes(1)
+$periodicRefreshTimer.Add_Tick({
+    # Event-driven refreshes remain the fast path. This timer is a quiet fallback
+    # for periods when the local rollout file does not emit a detectable change.
+    Start-DirectRefreshAsync
 })
 
 $waveTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -2630,12 +3442,19 @@ $window.Add_StateChanged({
 
 $window.Add_Loaded({
     Restore-WindowPosition
+    Update-OrbStyleToggleVisual
     $window.Opacity = 1
     if (-not $QARenderPath) {
         $countdownTimer.Start()
         $directWorkerTimer.Start()
         $resetCreditsWorkerTimer.Start()
+        $analyticsWorkerTimer.Start()
         $eventTimer.Start()
+        $periodicRefreshTimer.Start()
+    } elseif ($QAView -in @('daily', 'skill', 'skill-chain', 'agent', 'tool')) {
+        # QA analytics renders still need to collect the supervised local worker
+        # result before the screenshot timer fires.
+        $analyticsWorkerTimer.Start()
     }
     # Started after the first layout pass below to avoid competing with startup rendering.
 
@@ -2649,21 +3468,47 @@ $window.Add_Loaded({
 
     $window.Dispatcher.BeginInvoke([Action]{
         if ($QARenderPath) {
-            $qaPercentText = ('{0:0}%' -f $QARemaining)
-            $script:CurrentSnapshot = [pscustomobject]@{
-                Remaining   = $QARemaining
-                UsedPercent = 100.0 - $QARemaining
+            $qaObservedAt = [DateTimeOffset]::Now
+            $qaWeeklyRemaining = if ($QAFiveHourAvailable) {
+                [Math]::Min(100.0, $QARemaining + 21.0)
+            } else {
+                $QARemaining
             }
-            $PercentText.Text = $qaPercentText
-            $OrbPercentText.Text = $qaPercentText
-            $OrbPercentWaterText.Text = $qaPercentText
-            $UsedText.Text = ('已用 {0:0}% · CODEX' -f (100.0 - $QARemaining))
-            $ResetText.Text = '4 天 08:21'
-            $UpdatedText.Text = '12:48:16'
+            $qaWeeklySnapshot = [pscustomobject]@{
+                Source        = 'direct'
+                Remaining     = $qaWeeklyRemaining
+                UsedPercent   = 100.0 - $qaWeeklyRemaining
+                ResetAt       = $qaObservedAt.AddDays(4).AddHours(8).AddMinutes(21)
+                WindowMinutes = 10080L
+                PlanType      = 'plus'
+                LimitId       = 'codex'
+                ObservedAt    = $qaObservedAt
+                WindowName    = if ($QAFiveHourAvailable) { 'secondary' } else { 'primary' }
+            }
+            $qaFiveHourSnapshot = if ($QAFiveHourAvailable) {
+                [pscustomobject]@{
+                    Source        = 'direct'
+                    Remaining     = $QARemaining
+                    UsedPercent   = 100.0 - $QARemaining
+                    ResetAt       = $qaObservedAt.AddHours(4).AddMinutes(21)
+                    WindowMinutes = 300L
+                    PlanType      = 'plus'
+                    LimitId       = 'codex'
+                    ObservedAt    = $qaObservedAt
+                    WindowName    = 'primary'
+                }
+            } else {
+                $qaWeeklySnapshot
+            }
+            Apply-RateWindows `
+                -FiveHourSnapshot $qaFiveHourSnapshot `
+                -WeeklySnapshot $qaWeeklySnapshot `
+                -FiveHourUsesWeeklyFallback (-not $QAFiveHourAvailable) `
+                -SkipHistory
             $SevenDayTotalText.Text = '1.28M'
-            $OfficialRateText.Text = ('官方额度 {0}' -f $qaPercentText)
+            $OfficialRateText.Text = ('官方额度：5h 已用 {0:0}% · 1周已用 {1:0}%' -f
+                (100.0 - $QARemaining), (100.0 - $qaWeeklyRemaining))
             Update-OrbWaterLevel $QARemaining -Immediate
-            Update-ProgressFill
         } else {
             Refresh-Data -TryDirect $false
             Start-DirectRefreshAsync
@@ -2729,20 +3574,32 @@ $window.Add_Closing({
     $countdownTimer.Stop()
     $directWorkerTimer.Stop()
     $resetCreditsWorkerTimer.Stop()
+    $analyticsWorkerTimer.Stop()
     $eventTimer.Stop()
+    $periodicRefreshTimer.Stop()
     $waveTimer.Stop()
     Stop-OwnedProcess $script:DirectWorkerProcess
     $script:DirectWorkerProcess = $null
     Stop-OwnedProcess $script:ResetCreditsWorkerProcess
     $script:ResetCreditsWorkerProcess = $null
+    Stop-OwnedProcess $script:AnalyticsWorkerProcess
+    $script:AnalyticsWorkerProcess = $null
     $notifyIcon.Visible = $false
     $notifyIcon.Dispose()
+    if ($script:TrayIconResource) {
+        $script:TrayIconResource.Dispose()
+        $script:TrayIconResource = $null
+    }
 })
 
 try {
     [void]$window.ShowDialog()
 } finally {
     try { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } catch {}
+    if ($script:TrayIconResource) {
+        try { $script:TrayIconResource.Dispose() } catch {}
+        $script:TrayIconResource = $null
+    }
     if ($mutex) {
         try { $mutex.ReleaseMutex() } catch {}
         $mutex.Dispose()

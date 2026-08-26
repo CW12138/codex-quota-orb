@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.4.0 - 2026-08-26
+
+- Replaced the single-folder Skill count with a combined installed inventory and the latest locally observed Codex available-Skill catalog, including system, plugin, personal, and project scopes.
+- Made repeated participating-Token attribution the primary Skill measure while retaining exclusive terminal-Skill fields and unique attribution coverage.
+- Renamed route logic to multi-Skill call chains and preserved genuine chains of any observed length.
+- Kept quota and Token views first, then simplified workflow navigation to Token, Skill, Agent, and Tool.
+- Added readable Skill activity states and recent-use dates plus Agent completed-Turn, Tool, failure, and recent-use fields.
+- Replaced the narrow MCP page with read-only Tool categories covering commands, file edits, web, Agent coordination, media, documents, workflow controls, and MCP/connectors.
+- Added at most three deterministic local workflow hints without model generation.
+- Added regression checks that keep the analytics module free of network, model-client, and subprocess calls, preserving 0 Token consumption by the widget itself.
+
+## 1.3.1 - 2026-07-29
+
+- Replaced the generic information tray glyph with a simplified half-full blue water orb matching the floating UI.
+- Fixed the orb becoming unresponsive when recent Codex JSONL sessions contain very large tool-result records.
+- Replaced `Get-Content -Tail` with a byte-bounded random-access tail reader.
+- Moved session fallback reads and usage analytics off the WPF dispatcher into supervised child processes.
+- Added worker timeouts, concurrent pipe draining, and a UI-responsiveness regression test.
+- Added a compact icon-only Classic/Gradient switch to the expanded quota view with immediate, persisted style changes.
+- Reserved the compact orb for 5-hour quota and split the quota view into consistent 5-hour and 1-week modules.
+- Added duration-based window selection, weekly fallback while 5-hour quota is unavailable, and per-window reset timestamps.
+- Moved Reset Credits reads to `account/rateLimits/read.rateLimitResetCredits` and removed direct `auth.json` and internal backend access.
+
 ## 1.3.0 - 2026-07-23
 
 - Added an optional Gradient orb style with six continuously interpolated quota anchors from blue at 100% to orange at 0%.
