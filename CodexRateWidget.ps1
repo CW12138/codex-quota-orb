@@ -4,12 +4,18 @@
     [switch]$DirectWorker,
     [switch]$ResetCreditsWorker,
     [switch]$AnalyticsWorker,
+    [switch]$AccountWorker,
+    [ValidateSet('list', 'capture', 'switch', 'import-custom')][string]$AccountAction = 'list',
+    [string]$AccountId,
+    [string]$AccountLabel,
+    [string]$AccountImportDirectory,
     [switch]$QASolidWindow,
     [string]$QARenderPath,
     [string]$QATrayIconPath,
     [ValidateRange(0, 100)][double]$QARemaining = 64.0,
     [switch]$QAFiveHourAvailable,
-    [ValidateSet('orb', 'capacity', 'daily', 'skill', 'skill-chain', 'agent', 'tool', 'reset-credits')][string]$QAView = 'orb',
+    [switch]$QACustomProvider,
+    [ValidateSet('orb', 'capacity', 'account', 'daily', 'skill', 'skill-chain', 'agent', 'tool', 'reset-credits')][string]$QAView = 'orb',
     [ValidateSet('Auto', 'Classic', 'Gradient')][string]$OrbStyle = 'Auto',
     [int]$AutoCloseSeconds = 0
 )
@@ -38,7 +44,7 @@ namespace CodexQuotaOrb {
 }
 
 $mutex = $null
-if (-not $HeadlessProbe -and -not $DirectWorker -and -not $ResetCreditsWorker -and -not $AnalyticsWorker -and -not $QARenderPath -and -not $QATrayIconPath) {
+if (-not $HeadlessProbe -and -not $DirectWorker -and -not $ResetCreditsWorker -and -not $AnalyticsWorker -and -not $AccountWorker -and -not $QARenderPath -and -not $QATrayIconPath) {
     $createdNew = $false
     $mutex = New-Object System.Threading.Mutex($true, 'Local\CodexRateLimitWidget', [ref]$createdNew)
     if (-not $createdNew) {
@@ -79,6 +85,7 @@ $script:RuntimeDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationDa
 $script:CurrentSnapshot = $null
 $script:FiveHourSnapshot = $null
 $script:WeeklySnapshot = $null
+$script:IsCustomProviderActive = $false
 $script:FiveHourUsesWeeklyFallback = $true
 $script:LastRolloutPath = $null
 $script:LastRolloutWriteTicks = 0L
@@ -90,6 +97,9 @@ $script:DirectWorkerOutputTask = $null
 $script:DirectWorkerErrorTask = $null
 $script:PendingDirectRefresh = $false
 $script:ResetCreditsWorkerProcess = $null
+$script:ResetCreditsWorkerOutputTask = $null
+$script:ResetCreditsWorkerErrorTask = $null
+$script:ResetCreditsWorkerStartedAt = $null
 $script:IsResetCreditsRefreshing = $false
 $script:ResetCreditsSnapshot = $null
 $script:AnalyticsWorkerProcess = $null
@@ -98,6 +108,15 @@ $script:AnalyticsWorkerOutputTask = $null
 $script:AnalyticsWorkerErrorTask = $null
 $script:IsAnalyticsRefreshing = $false
 $script:AnalyticsSnapshot = $null
+$script:AccountWorkerProcess = $null
+$script:AccountWorkerOutputTask = $null
+$script:AccountWorkerErrorTask = $null
+$script:AccountWorkerAction = $null
+$script:AccountWorkerIdentityId = $null
+$script:AccountRegistrationProcess = $null
+$script:AccountRegistrationIdentityId = $null
+$script:IsAccountIdentityVerifying = $false
+$script:QuotaSwitchPrompted = $false
 $script:AccountUsage = $null
 $script:ActiveAnalyticsTab = 'daily'
 $script:ActiveSkillView = 'primary'
@@ -112,6 +131,7 @@ $script:OrbWaterTransitionActive = $false
 $script:WavePhase = 0.0
 $script:OrbIsDragging = $false
 $script:OrbPointerMoved = $false
+$script:PanelIsDragging = $false
 $script:TrayIconResource = $null
 $script:OrbThemeAnchors = @(
     [pscustomobject]@{ Remaining = 0.0;   Color = '#FFF0642F' }
@@ -136,6 +156,56 @@ $script:SettingsPath = Join-Path $script:RuntimeDir 'settings.json'
 $script:UsageCachePath = Join-Path $script:RuntimeDir 'usage-cache.json'
 $script:RateHistoryPath = Join-Path $script:RuntimeDir 'rate-history.jsonl'
 $script:UsageAnalyticsPath = Join-Path $script:ScriptDir 'UsageAnalytics.py'
+$script:AccountModulePath = Join-Path $script:ScriptDir 'AccountSwitcher.psm1'
+if (Test-Path -LiteralPath $script:AccountModulePath -PathType Leaf) {
+    Import-Module $script:AccountModulePath -Force
+    $script:AccountStore = Initialize-CqoAccountStore -RuntimeDirectory $script:RuntimeDir -CodexHome $script:CodexHome
+} else {
+    $script:AccountStore = $null
+}
+
+if ($AccountWorker) {
+    [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+    try {
+        if (-not $script:AccountStore) { throw '账号切换模块不存在。' }
+        $result = switch ($AccountAction) {
+            'list' { Get-CqoAccountRegistry -Store $script:AccountStore }
+            'capture' { Save-CqoCurrentChatGptAccount -Store $script:AccountStore -Label $AccountLabel }
+            'switch' {
+                if (-not $AccountId) { throw '缺少目标账号 ID。' }
+                try {
+                    Switch-CqoIdentity -Store $script:AccountStore -IdentityId $AccountId
+                } catch {
+                    $recoveryPlans = $_.Exception.Data['CqoRecoveryPlans']
+                    $recoveryId = $_.Exception.Data['CqoRecoveryIdentityId']
+                    if (-not $recoveryPlans -or -not $recoveryId) { throw }
+                    [pscustomobject]@{
+                        switched = $false
+                        recoveryPlans = @($recoveryPlans)
+                        recoveryId = [string]$recoveryId
+                        error = $_.Exception.Message
+                    }
+                }
+            }
+            'import-custom' {
+                if (-not $AccountImportDirectory) { throw '缺少配置目录。' }
+                Import-CqoCustomProfile `
+                    -Store $script:AccountStore `
+                    -AuthPath (Join-Path $AccountImportDirectory 'auth.json') `
+                    -ConfigPath (Join-Path $AccountImportDirectory 'config.toml') `
+                    -Label $AccountLabel
+            }
+        }
+        $wire = [pscustomobject]@{ success = $true; result = $result }
+    } catch {
+        $wire = [pscustomobject]@{ success = $false; error = $_.Exception.Message }
+    }
+    # A long-lived descendant can inherit stdout and keep ReadToEndAsync open
+    # after this worker exits. Send one complete result line and flush it.
+    [Console]::Out.WriteLine(($wire | ConvertTo-Json -Compress -Depth 20))
+    [Console]::Out.Flush()
+    exit 0
+}
 
 function Write-Diagnostic {
     param([string]$Message)
@@ -509,6 +579,30 @@ function ConvertFrom-RateWire {
 }
 
 function Read-AccountDataFromAppServer {
+    $identitySynchronized = $false
+    $launchContext = if ($script:AccountStore) {
+        try {
+            $syncResult = Sync-CqoActiveIdentity -Store $script:AccountStore -Detailed
+            $identitySynchronized = [bool]$syncResult.Resolved
+        } catch {
+            Write-Diagnostic ('Unable to reconcile the active Codex identity: ' + $_.Exception.Message)
+        }
+        Get-CqoActiveLaunchContext -Store $script:AccountStore
+    } else { $null }
+
+    if ($launchContext -and $launchContext.Identity -and [string]$launchContext.Identity.kind -eq 'custom') {
+        return [pscustomobject]@{
+            RateLimits               = $null
+            RateLimitResetCredits    = $null
+            ResetCreditsFieldPresent = $false
+            Usage                    = $null
+            RateError                = $null
+            UsageError               = $null
+            IdentitySynchronized     = $identitySynchronized
+            CustomProviderActive     = $true
+        }
+    }
+
     $exe = Find-CodexExecutable
     if (-not $exe) {
         throw '未找到 codex.exe。'
@@ -518,12 +612,22 @@ function Read-AccountDataFromAppServer {
     try {
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = $exe
-        $startInfo.Arguments = 'app-server --stdio'
+        $startInfo.Arguments = if ($launchContext -and $launchContext.Identity -and [string]$launchContext.Identity.kind -eq 'chatgpt') {
+            '--disable code_mode_host -c mcp_servers.node_repl.enabled=false -c model_provider=\"openai\" -c cli_auth_credentials_store=\"file\" app-server --stdio'
+        } else {
+            '--disable code_mode_host -c mcp_servers.node_repl.enabled=false app-server --stdio'
+        }
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
+        $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $startInfo.RedirectStandardInput = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
+        if ($launchContext) {
+            foreach ($name in $launchContext.Environment.Keys) {
+                $startInfo.EnvironmentVariables[[string]$name] = [string]$launchContext.Environment[$name]
+            }
+        }
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
@@ -540,7 +644,7 @@ function Read-AccountDataFromAppServer {
                 clientInfo = @{
                     name = 'codex_rate_widget'
                     title = 'Codex Quota Orb'
-                    version = '1.4.0'
+                    version = '1.5.2'
                 }
             }
         } | ConvertTo-Json -Compress -Depth 8
@@ -620,6 +724,8 @@ function Read-AccountDataFromAppServer {
             Usage                   = $usage
             RateError               = $rateError
             UsageError              = $usageError
+            IdentitySynchronized    = $identitySynchronized
+            CustomProviderActive    = $false
         }
     } finally {
         if ($process) {
@@ -826,6 +932,8 @@ if ($DirectWorker) {
         Usage      = if ($workerAccount) { $workerAccount.Usage } else { $null }
         RateError  = if ($workerAccount) { $workerAccount.RateError } else { $workerFailure }
         UsageError = if ($workerAccount) { $workerAccount.UsageError } else { $workerFailure }
+        IdentitySynchronized = if ($workerAccount) { [bool]$workerAccount.IdentitySynchronized } else { $false }
+        CustomProviderActive = if ($workerAccount) { [bool]$workerAccount.CustomProviderActive } else { $false }
     } | ConvertTo-Json -Compress -Depth 8
     exit 0
 }
@@ -968,6 +1076,25 @@ if ($HeadlessProbe) {
             <GradientStop Color="#1E356D8A" Offset="0.82"/>
             <GradientStop Color="#2CAFE5F8" Offset="1"/>
         </LinearGradientBrush>
+        <LinearGradientBrush x:Key="AccountGlassEdgeBrush" StartPoint="0,0" EndPoint="1,1">
+            <GradientStop Color="#D8F3FCFF" Offset="0"/>
+            <GradientStop Color="#71BFEAFF" Offset="0.24"/>
+            <GradientStop Color="#24FFFFFF" Offset="0.52"/>
+            <GradientStop Color="#315D91AD" Offset="0.76"/>
+            <GradientStop Color="#A0BDEBFF" Offset="1"/>
+        </LinearGradientBrush>
+        <LinearGradientBrush x:Key="AccountGlassSurfaceBrush" StartPoint="0,0" EndPoint="1,1">
+            <GradientStop Color="#F220394C" Offset="0"/>
+            <GradientStop Color="#EE152636" Offset="0.46"/>
+            <GradientStop Color="#F00D1C2A" Offset="0.72"/>
+            <GradientStop Color="#F2183543" Offset="1"/>
+        </LinearGradientBrush>
+        <RadialGradientBrush x:Key="AccountGlassGlowBrush" Center="0.13,0.02" GradientOrigin="0.08,-0.03" RadiusX="0.92" RadiusY="0.72">
+            <GradientStop Color="#62BDEEFF" Offset="0"/>
+            <GradientStop Color="#283B93C1" Offset="0.35"/>
+            <GradientStop Color="#0A7E6FBC" Offset="0.65"/>
+            <GradientStop Color="#00000000" Offset="1"/>
+        </RadialGradientBrush>
         <DrawingBrush x:Key="GlassTexture" TileMode="Tile" Viewport="0,0,42,42" ViewportUnits="Absolute" Stretch="None">
             <DrawingBrush.Drawing>
                 <DrawingGroup>
@@ -986,6 +1113,43 @@ if ($HeadlessProbe) {
                 </DrawingGroup>
             </DrawingBrush.Drawing>
         </DrawingBrush>
+        <Style TargetType="{x:Type ScrollBar}">
+            <Setter Property="Width" Value="7"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="{x:Type ScrollBar}">
+                        <Grid Width="7" Background="Transparent">
+                            <Track x:Name="PART_Track" Orientation="Vertical" IsDirectionReversed="True" Focusable="False">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Command="{x:Static ScrollBar.PageUpCommand}" Opacity="0" Focusable="False"/>
+                                </Track.DecreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb MinHeight="28" Margin="1,0">
+                                        <Thumb.Template>
+                                            <ControlTemplate TargetType="{x:Type Thumb}">
+                                                <Border x:Name="ThumbSurface" Background="#5689B9D2" CornerRadius="2.5"/>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                        <Setter TargetName="ThumbSurface" Property="Background" Value="#8ABFE6F7"/>
+                                                    </Trigger>
+                                                    <Trigger Property="IsDragging" Value="True">
+                                                        <Setter TargetName="ThumbSurface" Property="Background" Value="#B8DDF5FF"/>
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Thumb.Template>
+                                    </Thumb>
+                                </Track.Thumb>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Command="{x:Static ScrollBar.PageDownCommand}" Opacity="0" Focusable="False"/>
+                                </Track.IncreaseRepeatButton>
+                            </Track>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
         <Style x:Key="WindowButton" TargetType="Button">
             <Setter Property="Width" Value="27"/>
             <Setter Property="Height" Value="27"/>
@@ -997,6 +1161,7 @@ if ($HeadlessProbe) {
             <Setter Property="FontSize" Value="14"/>
             <Setter Property="FontWeight" Value="Bold"/>
             <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
@@ -1026,6 +1191,7 @@ if ($HeadlessProbe) {
             <Setter Property="FontSize" Value="11"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
@@ -1070,12 +1236,35 @@ if ($HeadlessProbe) {
             </Setter>
         </Style>
         <Style x:Key="TabButton" TargetType="Button" BasedOn="{StaticResource ActionButton}">
-            <Setter Property="Height" Value="29"/>
+            <Setter Property="Height" Value="30"/>
             <Setter Property="Margin" Value="0,0,6,0"/>
-            <Setter Property="Background" Value="#18FFFFFF"/>
-            <Setter Property="BorderBrush" Value="#3CFFFFFF"/>
+            <Setter Property="Background" Value="#12FFFFFF"/>
+            <Setter Property="BorderBrush" Value="#2CFFFFFF"/>
             <Setter Property="Foreground" Value="#BFFFFFFF"/>
             <Setter Property="FontSize" Value="10"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="SegmentSurface" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="15">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="SegmentSurface" Property="Background" Value="#28FFFFFF"/>
+                                <Setter Property="Foreground" Value="#FFFFFFFF"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="SegmentSurface" Property="Background" Value="#3A6FB4D9"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="SecondaryActionButton" TargetType="Button" BasedOn="{StaticResource ActionButton}">
+            <Setter Property="Background" Value="#18FFFFFF"/>
+            <Setter Property="BorderBrush" Value="#38FFFFFF"/>
+            <Setter Property="Foreground" Value="#D8FFFFFF"/>
         </Style>
         <Style x:Key="AnalyticsProgress" TargetType="ProgressBar">
             <Setter Property="Height" Value="7"/>
@@ -1379,6 +1568,7 @@ if ($HeadlessProbe) {
                         </StackPanel>
                     </StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button x:Name="AccountSwitchButton" Style="{StaticResource WindowButton}" Content="⇄" FontFamily="Segoe UI Symbol" FontSize="13" ToolTip="切换账号或配置" AutomationProperties.Name="切换账号或配置"/>
                         <Button x:Name="OrbStyleToggleButton" Style="{StaticResource WindowButton}" ToolTip="切换悬浮球样式" AutomationProperties.Name="切换悬浮球样式">
                             <Grid Width="18" Height="10">
                                 <Ellipse x:Name="ClassicStyleDot" Width="8" Height="8" HorizontalAlignment="Left" Fill="#FF4D9FE8" Stroke="#F2FFFFFF" StrokeThickness="1.3"/>
@@ -1465,7 +1655,7 @@ if ($HeadlessProbe) {
                 </Grid>
 
                 <Button x:Name="AnalyticsButton" Grid.Row="3" Content="查看用量分析  ›" Style="{StaticResource ActionButton}" Margin="0,12,0,0"/>
-                <Button x:Name="ResetCreditsButton" Grid.Row="4" Content="查看重置卡  ›" Style="{StaticResource ActionButton}" Margin="0,8,0,0"/>
+                <Button x:Name="ResetCreditsButton" Grid.Row="4" Content="查看重置卡  ›" Style="{StaticResource SecondaryActionButton}" Margin="0,8,0,0"/>
             </Grid>
         </Border>
 
@@ -1530,22 +1720,24 @@ if ($HeadlessProbe) {
                     </StackPanel>
                 </Grid>
 
-                <Grid Grid.Row="1" Margin="0,8,0,4">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <StackPanel Grid.Column="0">
-                        <TextBlock Text="7  D A Y  T O T A L" Foreground="#8FFFFFFF" FontSize="8" FontWeight="Bold"/>
-                        <TextBlock x:Name="SevenDayTotalText" Text="--" Foreground="#FFFFFFFF" FontSize="29" FontWeight="Bold" Margin="0,1,0,0"/>
-                    </StackPanel>
-                    <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
-                        <Border Background="#242A4E76" CornerRadius="10" Padding="10,5">
-                            <TextBlock x:Name="AnalyticsSourceText" Text="LOCAL · 0 TOKEN" Foreground="#64AFFF" FontSize="9" FontWeight="Bold"/>
-                        </Border>
-                        <TextBlock x:Name="OfficialRateText" Text="官方额度 --" Foreground="#BFFFFFFF" FontSize="10" HorizontalAlignment="Right" Margin="0,5,2,0"/>
-                    </StackPanel>
-                </Grid>
+                <Border Grid.Row="1" Margin="0,7,0,4" Padding="12,7" CornerRadius="15" Background="#16FFFFFF" BorderBrush="#28FFFFFF" BorderThickness="1">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0">
+                            <TextBlock Text="7  D A Y  T O T A L" Foreground="#8FFFFFFF" FontSize="8" FontWeight="Bold"/>
+                            <TextBlock x:Name="SevenDayTotalText" Text="--" Foreground="#FFFFFFFF" FontSize="27" FontWeight="Bold" Margin="0,0,0,0"/>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
+                            <Border Background="#242A4E76" CornerRadius="10" Padding="10,5">
+                                <TextBlock x:Name="AnalyticsSourceText" Text="LOCAL · 0 TOKEN" Foreground="#64AFFF" FontSize="9" FontWeight="Bold"/>
+                            </Border>
+                            <TextBlock x:Name="OfficialRateText" Text="官方额度 --" Foreground="#BFFFFFFF" FontSize="10" HorizontalAlignment="Right" Margin="0,5,2,0"/>
+                        </StackPanel>
+                    </Grid>
+                </Border>
 
                 <UniformGrid Grid.Row="2" Columns="4" Margin="0,4,0,5">
                     <Button x:Name="DailyTabButton" Content="Token" Style="{StaticResource TabButton}"/>
@@ -1555,6 +1747,7 @@ if ($HeadlessProbe) {
                 </UniformGrid>
 
                 <Grid Grid.Row="3">
+                    <Border CornerRadius="17" Background="#10000000" BorderBrush="#18FFFFFF" BorderThickness="1" IsHitTestVisible="False"/>
                     <Grid x:Name="DailyPanel">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
@@ -1630,6 +1823,16 @@ if ($HeadlessProbe) {
                         </ScrollViewer>
                         <TextBlock x:Name="ToolHintText" Grid.Row="2" Text="仅读取已有本地记录；不调用模型，不连接或探测 MCP Server。" Foreground="#8FFFFFFF" FontSize="9" Margin="1,7,0,0" TextWrapping="Wrap"/>
                     </Grid>
+
+                    <Border x:Name="AnalyticsLoadingPanel" CornerRadius="17" Background="#E80A1420" BorderBrush="#35A9DCFA" BorderThickness="1" Padding="26">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="260">
+                            <Border Width="42" Height="42" CornerRadius="21" Background="#283F9ED8" BorderBrush="#5BCBF0FF" BorderThickness="1" HorizontalAlignment="Center">
+                                <TextBlock Text="↻" Foreground="#8DD8FFFF" FontFamily="Segoe UI Symbol" FontSize="20" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <TextBlock x:Name="AnalyticsLoadingTitle" Text="正在整理本地使用记录" Foreground="#F5FFFFFF" FontSize="13" FontWeight="SemiBold" TextAlignment="Center" Margin="0,14,0,0"/>
+                            <TextBlock x:Name="AnalyticsLoadingText" Text="仅汇总本机已有记录，首次打开可能需要几秒。" Foreground="#96D6E8F2" FontSize="9.5" TextAlignment="Center" TextWrapping="Wrap" LineHeight="15" Margin="0,7,0,0"/>
+                        </StackPanel>
+                    </Border>
                 </Grid>
 
                 <TextBlock x:Name="AnalyticsStatusText" Grid.Row="4" Text="准备本地统计…" Foreground="#9FFFFFFF" FontSize="9" VerticalAlignment="Bottom" TextTrimming="CharacterEllipsis"/>
@@ -1718,6 +1921,71 @@ if ($HeadlessProbe) {
                 </Grid>
             </Grid>
         </Border>
+
+        <Grid x:Name="AccountFlyoutLayer" Visibility="Collapsed" Background="Transparent">
+            <Border Width="354" MaxHeight="452" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="14"
+                    CornerRadius="26" BorderThickness="1.25" BorderBrush="{StaticResource AccountGlassEdgeBrush}"
+                    Background="{StaticResource AccountGlassSurfaceBrush}" ClipToBounds="True">
+                <Border.Effect>
+                    <DropShadowEffect Color="#020812" BlurRadius="34" ShadowDepth="9" Opacity="0.72"/>
+                </Border.Effect>
+                <Grid Margin="19,16,19,17">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.RowSpan="5" Margin="-10,-8,-10,-9" CornerRadius="21" Background="{StaticResource AccountGlassGlowBrush}" Opacity="0.92" IsHitTestVisible="False"/>
+                    <Border Grid.RowSpan="5" Margin="-10,-8,-10,-9" CornerRadius="21" Background="{StaticResource GlassSpecularBrush}" Opacity="0.78" IsHitTestVisible="False"/>
+                    <Border Grid.RowSpan="5" Margin="-10,-8,-10,-9" CornerRadius="21" Background="{StaticResource GlassTexture}" Opacity="0.16" IsHitTestVisible="False"/>
+                    <Border Grid.RowSpan="5" Margin="-7,-5,-7,-6" CornerRadius="19" BorderThickness="1" BorderBrush="#62D6F2FF" IsHitTestVisible="False"/>
+                    <Border Grid.RowSpan="5" Margin="-4,-2,-4,-3" CornerRadius="17" BorderThickness="1" BorderBrush="#26020B12" IsHitTestVisible="False"/>
+
+                    <Grid Grid.Row="0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Margin="8,6,12,2">
+                            <TextBlock Text="A C C O U N T   S W I T C H E R" Foreground="#B6E5F7FF" FontFamily="Segoe UI" FontSize="7.5" FontWeight="Bold"/>
+                            <TextBlock Text="账号与配置" Foreground="#FFFFFFFF" FontSize="16" FontWeight="Bold" Margin="0,3,0,0"/>
+                        </StackPanel>
+                        <Button x:Name="AccountFlyoutCloseButton" Grid.Column="1" Style="{StaticResource WindowButton}" Content="×" Background="#1FFFFFFF" Foreground="#D8F5FCFF" Margin="3,3,1,0" HorizontalAlignment="Right" VerticalAlignment="Top" ToolTip="关闭"/>
+                    </Grid>
+
+                    <Border Grid.Row="1" Margin="0,12,0,11" Padding="12,9" CornerRadius="14" Background="#3B5FA4B4" BorderBrush="#8DE8F8FF" BorderThickness="1">
+                        <TextBlock x:Name="ActiveIdentityText" Text="尚未登记当前账号" Foreground="#F2F8FDFF" FontSize="10" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                    </Border>
+
+                    <ScrollViewer Grid.Row="2" MaxHeight="272" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel>
+                            <TextBlock Text="CHATGPT 账号" Foreground="#A8CFEFFF" FontSize="8" FontWeight="Bold" Margin="2,0,0,7"/>
+                            <StackPanel x:Name="ChatGptAccountsPanel"/>
+                            <TextBlock Text="自定义配置" Foreground="#A8CFEFFF" FontSize="8" FontWeight="Bold" Margin="2,11,0,7"/>
+                            <StackPanel x:Name="CustomAccountsPanel"/>
+                        </StackPanel>
+                    </ScrollViewer>
+
+                    <ScrollViewer Grid.Row="3" MaxHeight="58" Margin="2,8,2,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <TextBlock x:Name="AccountFlyoutStatusText" Text="" Foreground="#C6E7F5FF" FontSize="9" Margin="0,1,4,1" TextWrapping="Wrap"/>
+                    </ScrollViewer>
+
+                    <Grid Grid.Row="4" Margin="0,11,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Button x:Name="SaveCurrentAccountButton" Grid.Column="0" Content="保存当前" Style="{StaticResource ActionButton}" Background="#3A5A91AC" BorderBrush="#7BCDEEFF" Height="31" FontSize="9" Margin="0,0,4,0"/>
+                        <Button x:Name="AddAccountButton" Grid.Column="1" Content="添加账号" Style="{StaticResource ActionButton}" Background="#3A5A91AC" BorderBrush="#7BCDEEFF" Height="31" FontSize="9" Margin="4,0,4,0"/>
+                        <Button x:Name="ImportCustomButton" Grid.Column="2" Content="导入配置" Style="{StaticResource ActionButton}" Background="#3A5A91AC" BorderBrush="#7BCDEEFF" Height="31" FontSize="9" Margin="4,0,0,0"/>
+                    </Grid>
+                </Grid>
+            </Border>
+        </Grid>
     </Grid>
 </Window>
 '@
@@ -1765,6 +2033,7 @@ $WeeklyResetText = $window.FindName('WeeklyResetText')
 $UpdatedText = $window.FindName('UpdatedText')
 $AnalyticsButton = $window.FindName('AnalyticsButton')
 $ResetCreditsButton = $window.FindName('ResetCreditsButton')
+$AccountSwitchButton = $window.FindName('AccountSwitchButton')
 $OrbStyleToggleButton = $window.FindName('OrbStyleToggleButton')
 $ClassicStyleDot = $window.FindName('ClassicStyleDot')
 $GradientStyleDot = $window.FindName('GradientStyleDot')
@@ -1795,6 +2064,9 @@ $ToolRowsPanel = $window.FindName('ToolRowsPanel')
 $AgentSummaryText = $window.FindName('AgentSummaryText')
 $ToolSummaryText = $window.FindName('ToolSummaryText')
 $ToolHintText = $window.FindName('ToolHintText')
+$AnalyticsLoadingPanel = $window.FindName('AnalyticsLoadingPanel')
+$AnalyticsLoadingTitle = $window.FindName('AnalyticsLoadingTitle')
+$AnalyticsLoadingText = $window.FindName('AnalyticsLoadingText')
 $WorkflowHintsPanel = $window.FindName('WorkflowHintsPanel')
 $DailySourceText = $window.FindName('DailySourceText')
 $RateHistoryText = $window.FindName('RateHistoryText')
@@ -1817,6 +2089,15 @@ $ResetCreditsRowsPanel = $window.FindName('ResetCreditsRowsPanel')
 $ResetCreditsStatePanel = $window.FindName('ResetCreditsStatePanel')
 $ResetCreditsStateText = $window.FindName('ResetCreditsStateText')
 $ResetCreditsRetryButton = $window.FindName('ResetCreditsRetryButton')
+$AccountFlyoutLayer = $window.FindName('AccountFlyoutLayer')
+$AccountFlyoutCloseButton = $window.FindName('AccountFlyoutCloseButton')
+$ActiveIdentityText = $window.FindName('ActiveIdentityText')
+$ChatGptAccountsPanel = $window.FindName('ChatGptAccountsPanel')
+$CustomAccountsPanel = $window.FindName('CustomAccountsPanel')
+$AccountFlyoutStatusText = $window.FindName('AccountFlyoutStatusText')
+$SaveCurrentAccountButton = $window.FindName('SaveCurrentAccountButton')
+$AddAccountButton = $window.FindName('AddAccountButton')
+$ImportCustomButton = $window.FindName('ImportCustomButton')
 
 $script:ClassicOrbVisuals = [pscustomobject]@{
     AtmosphereFill   = $OrbAtmosphereFill.Fill.Clone()
@@ -1835,6 +2116,520 @@ $script:ClassicOrbVisuals = [pscustomobject]@{
 function New-Brush {
     param([string]$Color)
     return [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString($Color))
+}
+
+function Set-AccountBackdropBlur {
+    param([bool]$Enabled)
+    # The chooser is its own compact surface. Hide the quota card completely
+    # while it is open so no rectangular backdrop remains around the flyout.
+    if ($Enabled) {
+        $GlowBorder.Visibility = 'Collapsed'
+    } elseif ($script:ViewMode -eq 'capacity') {
+        $GlowBorder.Visibility = 'Visible'
+    }
+}
+
+function Quote-WorkerArgument {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    return '"' + $Value.Replace('"', '\"') + '"'
+}
+
+function Format-AccountOperationError {
+    param([AllowNull()][string]$Message)
+    if (-not $Message) { return '账号操作失败，请重试。' }
+    if ($Message -match '(?i)invalidated oauth token|401 Unauthorized|access token could not be refreshed|logged out|signed in to another account|登录已失效') {
+        return '该账号的登录已失效。请点击该账号旁的“重新认证”。'
+    }
+    if ($Message -match '(?i)ParameterArgumentValidationErrorEmptyArrayNotAllowed|参数.*Threads|empty array') {
+        return '当前没有需要续接的终端会话。请重新点击目标账号完成切换。'
+    }
+
+    $candidate = @($Message -split '\r?\n' | Where-Object {
+        $_.Trim() -and $_ -notmatch '^\s*(At |所在位置|\+ |~+|CategoryInfo|FullyQualifiedErrorId)'
+    } | Select-Object -First 1)
+    $friendly = if ($candidate.Count -gt 0) { [string]$candidate[0].Trim() } else { '账号操作失败，请重试。' }
+    $friendly = $friendly -replace '^\s*(Switch-CqoIdentity|Save-CqoCurrentChatGptAccount|Import-CqoCustomProfile)\s*:\s*', ''
+    if ($friendly.Length -gt 180) { $friendly = $friendly.Substring(0, 177) + '…' }
+    return $friendly
+}
+
+function Format-IdentityQuota {
+    param(
+        $Identity,
+        [bool]$IsActive = $false
+    )
+    if ([string]$Identity.kind -eq 'custom') {
+        $model = if ($Identity.PSObject.Properties.Name -contains 'model' -and $Identity.model) { [string]$Identity.model } else { '自定义模型' }
+        return ($model + ' · 不监控额度')
+    }
+    if ($IsActive -and $script:FiveHourSnapshot) {
+        $weekly = if ($script:WeeklySnapshot) { [double]$script:WeeklySnapshot.Remaining } else { [double]$script:FiveHourSnapshot.Remaining }
+        return ('实时 · 5h {0:0}% · 1周 {1:0}%' -f [double]$script:FiveHourSnapshot.Remaining, $weekly)
+    }
+    if (-not $Identity.quota) {
+        return $(if ($Identity.planType) { ([string]$Identity.planType).ToUpperInvariant() + ' · 尚无额度缓存' } else { '尚无额度缓存' })
+    }
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $Identity.quota.primaryRemaining) { $parts.Add(('5h {0:0}%' -f [double]$Identity.quota.primaryRemaining)) }
+    if ($null -ne $Identity.quota.secondaryRemaining) { $parts.Add(('1周 {0:0}%' -f [double]$Identity.quota.secondaryRemaining)) }
+    $observed = $null
+    try { $observed = [DateTimeOffset]::Parse([string]$Identity.quota.observedAt).ToLocalTime() } catch {}
+    $quotaText = if ($parts.Count -gt 0) { $parts -join ' · ' } else { '额度缓存不可用' }
+    if ($observed) { $quotaText += (' · {0:MM/dd HH:mm}' -f $observed.LocalDateTime) }
+    return $quotaText
+}
+
+function New-IdentityChoiceButton {
+    param(
+        [Parameter(Mandatory = $true)]$Identity,
+        [Parameter(Mandatory = $true)][bool]$IsActive
+    )
+
+    $button = New-Object System.Windows.Controls.Button
+    $button.Style = $window.FindResource('ActionButton')
+    $button.Height = 53
+    $button.Margin = New-Object System.Windows.Thickness(0, 0, 0, 7)
+    $button.Padding = New-Object System.Windows.Thickness(12, 7, 10, 7)
+    $button.HorizontalContentAlignment = 'Stretch'
+    $button.Tag = [string]$Identity.id
+    $needsReauth = [string]$Identity.kind -eq 'chatgpt' -and
+        ($Identity.PSObject.Properties.Name -contains 'reauthRequired') -and [bool]$Identity.reauthRequired
+    # Keep account rows in the same glass palette as the flyout.  The previous
+    # opaque gray fills made the active identity look almost identical to an
+    # inactive row, especially against the dark flyout surface.
+    $button.Background = New-Brush $(if ($IsActive) { '#4A63C4D8' } else { '#201B3A4D' })
+    $button.BorderBrush = New-Brush $(if ($IsActive) { '#C7F3FFFF' } else { '#477EAEC5' })
+
+    $grid = New-Object System.Windows.Controls.Grid
+    $activeColumn = New-Object System.Windows.Controls.ColumnDefinition
+    $activeColumn.Width = 'Auto'
+    $mainColumn = New-Object System.Windows.Controls.ColumnDefinition
+    $mainColumn.Width = '*'
+    $stateColumn = New-Object System.Windows.Controls.ColumnDefinition
+    $stateColumn.Width = 'Auto'
+    [void]$grid.ColumnDefinitions.Add($activeColumn)
+    [void]$grid.ColumnDefinitions.Add($mainColumn)
+    [void]$grid.ColumnDefinitions.Add($stateColumn)
+
+    if ($IsActive) {
+        $activeMark = New-Object System.Windows.Controls.Border
+        $activeMark.Width = 3
+        $activeMark.Height = 30
+        $activeMark.CornerRadius = New-Object System.Windows.CornerRadius(2)
+        $activeMark.Background = New-Brush '#D5F8FFFF'
+        $activeMark.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+        $activeMark.VerticalAlignment = 'Center'
+        [System.Windows.Controls.Grid]::SetColumn($activeMark, 0)
+        [void]$grid.Children.Add($activeMark)
+    }
+
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $title = New-Object System.Windows.Controls.TextBlock
+    $title.Text = [string]$Identity.label
+    $title.Foreground = New-Brush '#F8FFFFFF'
+    $title.FontSize = 11
+    $title.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $title.TextTrimming = 'CharacterEllipsis'
+    $detail = New-Object System.Windows.Controls.TextBlock
+    $detail.Text = Format-IdentityQuota -Identity $Identity -IsActive $IsActive
+    $detail.Foreground = New-Brush '#C4DDEBF2'
+    $detail.FontSize = 8.5
+    $detail.Margin = New-Object System.Windows.Thickness(0, 4, 0, 0)
+    $detail.TextTrimming = 'CharacterEllipsis'
+    [void]$stack.Children.Add($title)
+    [void]$stack.Children.Add($detail)
+    [System.Windows.Controls.Grid]::SetColumn($stack, 1)
+    [void]$grid.Children.Add($stack)
+
+    $state = New-Object System.Windows.Controls.TextBlock
+    $state.Text = if ($needsReauth) { '需认证' } elseif ($IsActive) { '已登录' } else { '切换' }
+    $state.Foreground = New-Brush $(if ($IsActive) { '#C8F4FFFF' } else { '#8BD8FFFF' })
+    $state.FontSize = 9
+    $state.FontWeight = [System.Windows.FontWeights]::Bold
+    $state.VerticalAlignment = 'Center'
+    $state.Margin = New-Object System.Windows.Thickness(10, 0, 0, 0)
+    [System.Windows.Controls.Grid]::SetColumn($state, 2)
+    [void]$grid.Children.Add($state)
+    $button.Content = $grid
+    $button.Add_Click({
+        param($sender, $eventArgs)
+        $registry = Get-CqoAccountRegistry -Store $script:AccountStore
+        $chosen = @($registry.accounts | Where-Object { [string]$_.id -eq [string]$sender.Tag } | Select-Object -First 1)
+        if ($chosen.Count -gt 0 -and
+            ($chosen[0].PSObject.Properties.Name -contains 'reauthRequired') -and [bool]$chosen[0].reauthRequired) {
+            Start-AccountRegistration -IdentityId ([string]$sender.Tag)
+        } elseif ([string]$sender.Tag -eq [string]$registry.activeId) {
+            Start-ManagedResumeWindow -IdentityId ([string]$sender.Tag)
+        } else {
+            Start-AccountWorker -Action 'switch' -IdentityId ([string]$sender.Tag)
+        }
+        $eventArgs.Handled = $true
+    })
+    if ([string]$Identity.kind -ne 'chatgpt') { return $button }
+
+    $row = New-Object System.Windows.Controls.Grid
+    $row.Margin = New-Object System.Windows.Thickness(0, 0, 0, 7)
+    $mainColumn = New-Object System.Windows.Controls.ColumnDefinition
+    $mainColumn.Width = '*'
+    $verifyColumn = New-Object System.Windows.Controls.ColumnDefinition
+    $verifyColumn.Width = 'Auto'
+    [void]$row.ColumnDefinitions.Add($mainColumn)
+    [void]$row.ColumnDefinitions.Add($verifyColumn)
+    $button.Margin = New-Object System.Windows.Thickness(0)
+    [System.Windows.Controls.Grid]::SetColumn($button, 0)
+    [void]$row.Children.Add($button)
+
+    $verify = New-Object System.Windows.Controls.Button
+    $verify.Style = $window.FindResource('ActionButton')
+    $verify.Content = if ($needsReauth) { '重新认证' } else { '验证' }
+    $verify.ToolTip = '打开官方 Codex 登录页面，重新认证并切换到此账号'
+    $verify.Tag = [string]$Identity.id
+    $verify.Width = 72
+    $verify.Height = 53
+    $verify.FontSize = 9
+    $verify.Margin = New-Object System.Windows.Thickness(6, 0, 0, 0)
+    $verify.Background = New-Brush $(if ($needsReauth) { '#475D748B' } else { '#20375870' })
+    $verify.BorderBrush = New-Brush $(if ($needsReauth) { '#A7E5FFFF' } else { '#477EAEC5' })
+    $verify.Add_Click({
+        param($sender, $eventArgs)
+        Start-AccountRegistration -IdentityId ([string]$sender.Tag)
+        $eventArgs.Handled = $true
+    })
+    [System.Windows.Controls.Grid]::SetColumn($verify, 1)
+    [void]$row.Children.Add($verify)
+    return $row
+}
+
+function Add-IdentityEmptyState {
+    param(
+        [Parameter(Mandatory = $true)]$Panel,
+        [Parameter(Mandatory = $true)][string]$Text
+    )
+    $empty = New-Object System.Windows.Controls.TextBlock
+    $empty.Text = $Text
+    $empty.Foreground = New-Brush '#78FFFFFF'
+    $empty.FontSize = 9
+    $empty.Margin = New-Object System.Windows.Thickness(2, 4, 0, 5)
+    [void]$Panel.Children.Add($empty)
+}
+
+function Refresh-AccountFlyout {
+    param([switch]$ClearStatus)
+
+    $ChatGptAccountsPanel.Children.Clear()
+    $CustomAccountsPanel.Children.Clear()
+    if ($ClearStatus) { $AccountFlyoutStatusText.Text = '' }
+    if (-not $script:AccountStore) {
+        $ActiveIdentityText.Text = '账号切换模块不可用'
+        Add-IdentityEmptyState -Panel $ChatGptAccountsPanel -Text '安装文件不完整'
+        Add-IdentityEmptyState -Panel $CustomAccountsPanel -Text '安装文件不完整'
+        return
+    }
+
+    try {
+        $registry = if ($QARenderPath -and $QAView -eq 'account') {
+            $qaNow = [DateTimeOffset]::Now
+            [pscustomobject]@{
+                activeId = 'qa-primary'
+                accounts = @(
+                    [pscustomobject]@{ id = 'qa-primary'; kind = 'chatgpt'; label = '主账号 · Plus'; planType = 'plus'; quota = $null },
+                    [pscustomobject]@{ id = 'qa-secondary'; kind = 'chatgpt'; label = '备用账号 · Plus'; planType = 'plus'; reauthRequired = $true; quota = [pscustomobject]@{ primaryRemaining = 82; secondaryRemaining = 47; observedAt = $qaNow.AddMinutes(-18).ToString('o') } },
+                    [pscustomobject]@{ id = 'qa-custom'; kind = 'custom'; label = '自定义服务'; model = 'gpt-5.6-sol'; quota = $null }
+                )
+            }
+        } else {
+            Get-CqoAccountRegistry -Store $script:AccountStore
+        }
+        $accounts = @($registry.accounts)
+        $activeId = if ($script:IsAccountIdentityVerifying) { $null } else { [string]$registry.activeId }
+        $active = @($accounts | Where-Object { [string]$_.id -eq $activeId }) | Select-Object -First 1
+        $ActiveIdentityText.Text = if ($script:IsAccountIdentityVerifying) {
+            '正在核对当前 Codex 身份…'
+        } elseif ($active) {
+            '当前：' + [string]$active.label
+        } else {
+            '尚未登记当前账号'
+        }
+        $AccountSwitchButton.ToolTip = if ($active) { '当前身份：' + [string]$active.label } else { '切换账号或配置' }
+
+        $chatgpt = @($accounts | Where-Object { [string]$_.kind -eq 'chatgpt' })
+        $custom = @($accounts | Where-Object { [string]$_.kind -eq 'custom' })
+        foreach ($identity in $chatgpt) {
+            [void]$ChatGptAccountsPanel.Children.Add((New-IdentityChoiceButton -Identity $identity -IsActive ([string]$identity.id -eq $activeId)))
+        }
+        foreach ($identity in $custom) {
+            [void]$CustomAccountsPanel.Children.Add((New-IdentityChoiceButton -Identity $identity -IsActive ([string]$identity.id -eq $activeId)))
+        }
+        if ($chatgpt.Count -eq 0) { Add-IdentityEmptyState -Panel $ChatGptAccountsPanel -Text '先保存当前包月账号，再添加第二个账号' }
+        if ($custom.Count -eq 0) { Add-IdentityEmptyState -Panel $CustomAccountsPanel -Text '尚未导入 auth.json + config.toml' }
+    } catch {
+        $ActiveIdentityText.Text = '读取账号列表失败'
+        $AccountFlyoutStatusText.Text = '失败：' + (Format-AccountOperationError -Message $_.Exception.Message)
+    }
+}
+
+function Show-AccountFlyout {
+    $script:IsAccountIdentityVerifying = $true
+    Refresh-AccountFlyout -ClearStatus
+    if ($script:ViewMode -eq 'capacity') {
+        Resize-WindowAroundCenter -Width 382 -Height 480
+    }
+    Set-AccountBackdropBlur $true
+    $AccountFlyoutLayer.Visibility = 'Visible'
+    $AccountFlyoutStatusText.Text = '正在同步当前 Codex 会话…'
+    Set-AccountControlsEnabled $false
+    Start-DirectRefreshAsync
+    [void]$AccountFlyoutCloseButton.Focus()
+}
+
+function Hide-AccountFlyout {
+        $AccountFlyoutLayer.Visibility = 'Collapsed'
+        Set-AccountBackdropBlur $false
+        if ($script:ViewMode -eq 'capacity') {
+            Resize-WindowAroundCenter -Width 420 -Height 410
+        }
+}
+
+function Set-AccountControlsEnabled {
+    param([bool]$Enabled)
+    $ChatGptAccountsPanel.IsEnabled = $Enabled
+    $CustomAccountsPanel.IsEnabled = $Enabled
+    $SaveCurrentAccountButton.IsEnabled = $Enabled
+    $AddAccountButton.IsEnabled = $Enabled
+    $ImportCustomButton.IsEnabled = $Enabled
+    $AccountFlyoutCloseButton.IsEnabled = $true
+}
+
+function Complete-AccountIdentityVerification {
+    param([bool]$Resolved)
+    if (-not $script:IsAccountIdentityVerifying) { return }
+    $script:IsAccountIdentityVerifying = $false
+    if ($AccountFlyoutLayer.Visibility -ne [System.Windows.Visibility]::Visible) { return }
+    Refresh-AccountFlyout
+    $AccountFlyoutStatusText.Text = if ($Resolved) {
+        '已与当前 Codex 会话同步。'
+    } else {
+        '暂时无法确认当前会话；显示最近一次已选择的身份。'
+    }
+    Set-AccountControlsEnabled $true
+}
+
+function Get-WorkerOutputState {
+    param($Worker, $OutputTask, $ErrorTask, [switch]$ResultLine)
+    if ($ResultLine -and $OutputTask.IsCompleted) { return 'ready' }
+    if ($OutputTask.IsCompleted -and $ErrorTask.IsCompleted) { return 'ready' }
+    # An exited worker can leave its pipe open in a descendant. Never wait on
+    # that pipe on WPF's dispatcher, even after HasExited becomes true.
+    if (([DateTime]::Now - $Worker.ExitTime).TotalSeconds -ge 5) { return 'timeout' }
+    return 'pending'
+}
+
+function Start-AccountWorker {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('capture', 'switch', 'import-custom')][string]$Action,
+        [string]$IdentityId,
+        [string]$ImportDirectory
+    )
+    if ($script:AccountWorkerProcess -or $script:AccountRegistrationProcess) { return }
+
+    $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File {0} -AccountWorker -AccountAction {1}' -f `
+        (Quote-WorkerArgument $script:ScriptPath), $Action
+    if ($IdentityId) { $arguments += ' -AccountId ' + (Quote-WorkerArgument $IdentityId) }
+    if ($ImportDirectory) { $arguments += ' -AccountImportDirectory ' + (Quote-WorkerArgument $ImportDirectory) }
+
+    $workerInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $workerInfo.FileName = (Get-Command powershell.exe).Source
+    $workerInfo.Arguments = $arguments
+    $workerInfo.UseShellExecute = $false
+    $workerInfo.CreateNoWindow = $true
+    $workerInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $workerInfo.RedirectStandardOutput = $true
+    $workerInfo.RedirectStandardError = $true
+    $workerInfo.StandardOutputEncoding = New-Object Text.UTF8Encoding($false)
+    $worker = New-Object System.Diagnostics.Process
+    $worker.StartInfo = $workerInfo
+    [void]$worker.Start()
+    $script:AccountWorkerProcess = $worker
+    $script:AccountWorkerOutputTask = $worker.StandardOutput.ReadLineAsync()
+    $script:AccountWorkerErrorTask = $worker.StandardError.ReadToEndAsync()
+    $script:AccountWorkerAction = $Action
+    $script:AccountWorkerIdentityId = $IdentityId
+    $AccountFlyoutStatusText.Text = switch ($Action) {
+        'capture' { '正在加密保存当前账号…' }
+        'switch' { '正在暂停任务并切换身份…' }
+        default { '正在验证并导入配置…' }
+    }
+    Set-AccountControlsEnabled $false
+}
+
+function Start-ManagedResumeWindow {
+    param(
+        $Plan,
+        [Parameter(Mandatory = $true)][string]$IdentityId
+    )
+    $resumeDirectory = Join-Path $script:RuntimeDir 'resume'
+    if (-not (Test-Path -LiteralPath $resumeDirectory)) {
+        New-Item -ItemType Directory -Path $resumeDirectory -Force | Out-Null
+    }
+    $promptPath = $null
+    if ($Plan -and $Plan.prompt) {
+        $promptPath = Join-Path $resumeDirectory ([Guid]::NewGuid().ToString('N') + '.txt')
+        Set-Content -LiteralPath $promptPath -Value ([string]$Plan.prompt) -Encoding UTF8 -NoNewline
+    }
+    $helper = Join-Path $script:ScriptDir 'Resume-CodexSession.ps1'
+    $argumentLine = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File {0} -IdentityId {1} -RuntimeDirectory {2} -CodexHome {3}' -f `
+        (Quote-WorkerArgument $helper), (Quote-WorkerArgument $IdentityId), (Quote-WorkerArgument $script:RuntimeDir), (Quote-WorkerArgument $script:CodexHome)
+    if ($Plan -and $Plan.threadId) { $argumentLine += ' -SessionId ' + (Quote-WorkerArgument ([string]$Plan.threadId)) }
+    if ($promptPath) { $argumentLine += ' -PromptPath ' + (Quote-WorkerArgument $promptPath) }
+    if ($Plan -and $Plan.cwd) { $argumentLine += ' -WorkingDirectory ' + (Quote-WorkerArgument ([string]$Plan.cwd)) }
+    Start-CqoVisibleTerminal -PowerShellArguments $argumentLine
+}
+
+function Start-CqoVisibleTerminal {
+    param([Parameter(Mandatory = $true)][string]$PowerShellArguments)
+
+    $powershellPath = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
+    $windowsTerminal = Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue
+    if ($windowsTerminal) {
+        $terminalArguments = '-w new -- {0} {1}' -f `
+            (Quote-WorkerArgument $powershellPath), $PowerShellArguments
+        try {
+            Start-Process -FilePath $windowsTerminal.Source -ArgumentList $terminalArguments | Out-Null
+            return
+        } catch {
+            Write-Diagnostic ('Windows Terminal launch failed; using PowerShell: ' + $_.Exception.Message)
+        }
+    }
+
+    Start-Process -FilePath $powershellPath -ArgumentList $PowerShellArguments -WindowStyle Normal | Out-Null
+}
+
+function Complete-AccountWorkerIfReady {
+    $worker = $script:AccountWorkerProcess
+    if (-not $worker -or -not $worker.HasExited) { return }
+    $outputState = Get-WorkerOutputState $worker $script:AccountWorkerOutputTask $script:AccountWorkerErrorTask -ResultLine
+    if ($outputState -eq 'pending') { return }
+    $switchCompleted = $false
+    $reauthId = $null
+    try {
+        if ($outputState -eq 'timeout') { throw '账号操作已结束，但结果管道未关闭。请刷新账号列表后检查当前身份。' }
+        $output = [string]$script:AccountWorkerOutputTask.Result
+        if (-not $output) { throw '账号操作未返回结果。' }
+        $wire = $output | ConvertFrom-Json
+        if (-not $wire.success) {
+            if ($script:AccountWorkerAction -eq 'switch' -and $script:AccountWorkerIdentityId -and
+                [string]$wire.error -match '登录已失效|凭据与登记信息不一致|加密凭据不存在') {
+                $reauthId = [string]$script:AccountWorkerIdentityId
+            }
+            throw [string]$wire.error
+        }
+        $result = $wire.result
+        if ($script:AccountWorkerAction -eq 'switch' -and $result -and $result.recoveryPlans) {
+            $recoveryFailures = 0
+            foreach ($plan in @($result.recoveryPlans)) {
+                try {
+                    Start-ManagedResumeWindow -Plan $plan -IdentityId ([string]$result.recoveryId)
+                } catch {
+                    $recoveryFailures++
+                    Write-Diagnostic ('Unable to reopen a rolled-back session: ' + $_.Exception.Message)
+                }
+            }
+            $reason = Format-AccountOperationError -Message ([string]$result.error)
+            $AccountFlyoutStatusText.Text = if ($recoveryFailures -gt 0) {
+                '切换失败：' + $reason + '；原账号已恢复，部分会话需手动重新打开。'
+            } else {
+                '切换失败：' + $reason + '；已恢复原账号并重新打开会话。'
+            }
+        } elseif ($script:AccountWorkerAction -eq 'switch' -and $result -and $result.identity) {
+            # The credential/daemon transaction is already complete at this
+            # point. Opening a visible continuation is a follow-up action and
+            # must not turn a successful account switch into an error banner.
+            $switchCompleted = $true
+            $resumeFailures = 0
+            foreach ($plan in @($result.threads)) {
+                try {
+                    Start-ManagedResumeWindow -Plan $plan -IdentityId ([string]$result.identity.id)
+                } catch {
+                    $resumeFailures++
+                    Write-Diagnostic ('Unable to reopen a switched session: ' + $_.Exception.Message)
+                }
+            }
+            $AccountFlyoutStatusText.Text = if ($resumeFailures -gt 0) {
+                '账号已切换；部分会话未能自动打开，请手动启动 Codex。'
+            } elseif (@($result.threads).Count -gt 0) {
+                '切换完成，已打开会话续接窗口。'
+            } else {
+                '账号切换完成。'
+            }
+            $script:QuotaSwitchPrompted = $false
+            Start-DirectRefreshAsync
+            Start-AnalyticsRefreshAsync
+        } elseif ($script:AccountWorkerAction -eq 'capture') {
+            $AccountFlyoutStatusText.Text = '当前账号已加密保存。'
+        } elseif ($script:AccountWorkerAction -eq 'import-custom') {
+            $AccountFlyoutStatusText.Text = '自定义配置已安全导入。'
+        }
+        Refresh-AccountFlyout
+    } catch {
+        $AccountFlyoutStatusText.Text = if ($switchCompleted) {
+            '账号已切换；界面刷新未完成，请重新打开账号面板确认当前身份。'
+        } else {
+            '失败：' + (Format-AccountOperationError -Message $_.Exception.Message)
+        }
+        Refresh-AccountFlyout
+    } finally {
+        $worker.Dispose()
+        $script:AccountWorkerProcess = $null
+        $script:AccountWorkerOutputTask = $null
+        $script:AccountWorkerErrorTask = $null
+        $script:AccountWorkerAction = $null
+        $script:AccountWorkerIdentityId = $null
+        Set-AccountControlsEnabled $true
+    }
+    if ($reauthId) {
+        try {
+            Start-AccountRegistration -IdentityId $reauthId
+        } catch {
+            $AccountFlyoutStatusText.Text = '无法打开重新认证窗口：' + (Format-AccountOperationError -Message $_.Exception.Message)
+        }
+    }
+}
+
+function Start-AccountRegistration {
+    param([string]$IdentityId)
+    if ($script:AccountRegistrationProcess -or $script:AccountWorkerProcess) { return }
+    $helper = Join-Path $script:ScriptDir 'Register-CodexAccount.ps1'
+    $argumentLine = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File {0} -RuntimeDirectory {1} -CodexHome {2}' -f `
+        (Quote-WorkerArgument $helper), (Quote-WorkerArgument $script:RuntimeDir), (Quote-WorkerArgument $script:CodexHome)
+    if ($IdentityId) { $argumentLine += ' -IdentityId ' + (Quote-WorkerArgument $IdentityId) }
+    $script:AccountRegistrationProcess = Start-Process -FilePath (Get-Command powershell.exe).Source -ArgumentList $argumentLine -PassThru
+    $script:AccountRegistrationIdentityId = $IdentityId
+    $AccountFlyoutStatusText.Text = if ($IdentityId) {
+        '请在新窗口用所选账号完成官方登录；验证后将自动切换并续接会话。'
+    } else {
+        '请在新窗口完成官方 ChatGPT 登录…'
+    }
+    Set-AccountControlsEnabled $false
+}
+
+function Complete-AccountRegistrationIfReady {
+    $process = $script:AccountRegistrationProcess
+    if (-not $process -or -not $process.HasExited) { return }
+    try {
+        $AccountFlyoutStatusText.Text = if ($process.ExitCode -eq 0) {
+            if ($script:AccountRegistrationIdentityId) { '账号已重新认证并切换。' } else { '新账号已登记。' }
+        } else {
+            if ($script:AccountRegistrationIdentityId) { '重新认证未完成；原账号保持不变。' } else { '账号登记未完成，已恢复原账号。' }
+        }
+        Refresh-AccountFlyout
+        Start-DirectRefreshAsync
+    } finally {
+        $process.Dispose()
+        $script:AccountRegistrationProcess = $null
+        $script:AccountRegistrationIdentityId = $null
+        Set-AccountControlsEnabled $true
+    }
 }
 
 function ConvertTo-OrbColor {
@@ -2039,6 +2834,7 @@ function Format-QuotaResetText {
 }
 
 function Update-Countdown {
+    if ($script:IsCustomProviderActive) { return }
     $FiveHourResetText.Text = Format-QuotaResetText $script:FiveHourSnapshot
     $WeeklyResetText.Text = Format-QuotaResetText $script:WeeklySnapshot
 }
@@ -2167,6 +2963,7 @@ function Apply-RateWindows {
         $FiveHourUsesWeeklyFallback = $true
     }
 
+    $script:IsCustomProviderActive = $false
     $script:CurrentSnapshot = $FiveHourSnapshot
     $script:FiveHourSnapshot = $FiveHourSnapshot
     $script:WeeklySnapshot = $WeeklySnapshot
@@ -2183,8 +2980,12 @@ function Apply-RateWindows {
     $weeklyAccentBrush = New-Brush $weeklyAccent
     $PercentText.Text = ('{0:0}%' -f $remaining)
     $WeeklyPercentText.Text = ('{0:0}%' -f $weeklyRemaining)
+    $PercentText.FontSize = 35
+    $WeeklyPercentText.FontSize = 35
     $OrbPercentText.Text = ('{0:0}%' -f $remaining)
     $OrbPercentWaterText.Text = $OrbPercentText.Text
+    $OrbPercentText.FontSize = 18
+    $OrbPercentWaterText.FontSize = 18
     Update-OrbWaterLevel $remaining
     $CapacityFill.Background = $accentBrush
     $WeeklyCapacityFill.Background = $weeklyAccentBrush
@@ -2216,6 +3017,18 @@ function Apply-RateWindows {
     if ($script:AnalyticsSnapshot) {
         Apply-AnalyticsSnapshot $script:AnalyticsSnapshot
     }
+
+    if (-not $QARenderPath -and $remaining -le 0 -and -not $script:QuotaSwitchPrompted -and $script:AccountStore) {
+        $script:QuotaSwitchPrompted = $true
+        if (-not $window.IsVisible) { $window.Show() }
+        $window.WindowState = [System.Windows.WindowState]::Normal
+        Show-CapacityView
+        Show-AccountFlyout
+        $AccountFlyoutStatusText.Text = '当前账号额度已耗尽。请选择另一个账号或配置；不会使用或重置任何额度卡。'
+        $window.Activate()
+    } elseif ($remaining -gt 0) {
+        $script:QuotaSwitchPrompted = $false
+    }
 }
 
 function Apply-Snapshot {
@@ -2224,16 +3037,62 @@ function Apply-Snapshot {
     Apply-RateWindows -FiveHourSnapshot $Snapshot -WeeklySnapshot $Snapshot -FiveHourUsesWeeklyFallback $true
 }
 
+function Apply-CustomProviderState {
+    $script:IsCustomProviderActive = $true
+    $script:CurrentSnapshot = $null
+    $script:FiveHourSnapshot = $null
+    $script:WeeklySnapshot = $null
+    $script:AccountUsage = $null
+    $script:FiveHourUsesWeeklyFallback = $false
+    $script:QuotaSwitchPrompted = $false
+
+    $accentBrush = New-Brush '#64D2FF'
+    $PercentText.Text = '∞'
+    $WeeklyPercentText.Text = '∞'
+    $PercentText.FontSize = 38
+    $WeeklyPercentText.FontSize = 38
+    $OrbPercentText.Text = '∞'
+    $OrbPercentWaterText.Text = '∞'
+    $OrbPercentText.FontSize = 26
+    $OrbPercentWaterText.FontSize = 26
+    Update-OrbWaterLevel 100 -Immediate
+
+    $CapacityFill.Width = 0
+    $WeeklyCapacityFill.Width = 0
+    $CapacityFill.Background = $accentBrush
+    $WeeklyCapacityFill.Background = $accentBrush
+    $StatusDot.Fill = $accentBrush
+    $StatusHalo.Background = New-Brush '#2664D2FF'
+    $SourceBadge.Background = New-Brush '#24305B70'
+    $SourceText.Text = 'CUSTOM · ∞'
+    $SourceText.Foreground = $accentBrush
+    $FiveHourUsedText.Text = '自定义配置 · 不监控额度'
+    $WeeklyUsedText.Text = '自定义配置 · 不监控额度'
+    $FiveHourFallbackText.Visibility = 'Collapsed'
+    $FiveHourResetText.Text = '无需额度快照'
+    $WeeklyResetText.Text = '无需额度快照'
+    $UpdatedText.Text = '—'
+
+    if ($script:AnalyticsSnapshot) {
+        Apply-AnalyticsSnapshot $script:AnalyticsSnapshot
+    }
+}
+
 function Apply-EmptyState {
     param([string]$Message)
+    $script:IsCustomProviderActive = $false
     $script:CurrentSnapshot = $null
     $script:FiveHourSnapshot = $null
     $script:WeeklySnapshot = $null
     $script:FiveHourUsesWeeklyFallback = $true
     $PercentText.Text = '--%'
     $WeeklyPercentText.Text = '--%'
+    $PercentText.FontSize = 35
+    $WeeklyPercentText.FontSize = 35
     $OrbPercentText.Text = '--%'
     $OrbPercentWaterText.Text = '--%'
+    $OrbPercentText.FontSize = 18
+    $OrbPercentWaterText.FontSize = 18
     Update-OrbWaterLevel 0
     $CapacityFill.Width = 0
     $WeeklyCapacityFill.Width = 0
@@ -2598,9 +3457,10 @@ function Apply-AnalyticsSnapshot {
     if (-not $Snapshot) { return }
 
     Write-Diagnostic 'Applying analytics snapshot.'
+    $AnalyticsLoadingPanel.Visibility = 'Collapsed'
     $dailyView = Get-DisplayDailyUsage $Snapshot
     $SevenDayTotalText.Text = Format-TokenCount ([long]$dailyView.Total)
-    $AnalyticsSourceText.Text = ($dailyView.Source + ' · 0 TOKEN')
+    $AnalyticsSourceText.Text = ($dailyView.Source + ' · ' + (Format-TokenCount ([long]$dailyView.Total)) + ' TOKEN')
     $DailySourceText.Text = if ($dailyView.Source -eq 'ACCOUNT API') { '当前账号每日桶（兜底）' } else { '本机全部账号会话' }
     Render-UsageRows -Panel $DailyRowsPanel -Rows $dailyView.Rows -Mode daily
     Write-Diagnostic 'Rendered daily analytics rows.'
@@ -2643,7 +3503,9 @@ function Apply-AnalyticsSnapshot {
         [void]$WorkflowHintsPanel.Children.Add($hint)
     }
     Set-SkillView $script:ActiveSkillView
-    $OfficialRateText.Text = if ($script:FiveHourSnapshot -and $script:WeeklySnapshot) {
+    $OfficialRateText.Text = if ($script:IsCustomProviderActive) {
+        '自定义配置 · 不监控额度'
+    } elseif ($script:FiveHourSnapshot -and $script:WeeklySnapshot) {
         '官方额度：5h 已用 {0:0}% · 1周已用 {1:0}%' -f
             ([double]$script:FiveHourSnapshot.UsedPercent),
             ([double]$script:WeeklySnapshot.UsedPercent)
@@ -2718,6 +3580,8 @@ function Resize-WindowAroundCenter {
 
 function Show-OrbView {
     $script:ViewMode = 'orb'
+    Set-AccountBackdropBlur $false
+    $AccountFlyoutLayer.Visibility = 'Collapsed'
     $GlowBorder.Visibility = 'Collapsed'
     $AnalyticsBorder.Visibility = 'Collapsed'
     $ResetCreditsBorder.Visibility = 'Collapsed'
@@ -2731,6 +3595,8 @@ function Show-OrbView {
 
 function Show-AnalyticsView {
     $script:ViewMode = 'analytics'
+    Set-AccountBackdropBlur $false
+    $AccountFlyoutLayer.Visibility = 'Collapsed'
     $OrbView.Visibility = 'Collapsed'
     $GlowBorder.Visibility = 'Collapsed'
     $ResetCreditsBorder.Visibility = 'Collapsed'
@@ -2739,17 +3605,23 @@ function Show-AnalyticsView {
     Set-AnalyticsTab $script:ActiveAnalyticsTab
     if ($script:AnalyticsSnapshot) {
         Apply-AnalyticsSnapshot $script:AnalyticsSnapshot
+    } else {
+        $AnalyticsLoadingTitle.Text = '正在整理本地使用记录'
+        $AnalyticsLoadingText.Text = '仅汇总本机已有记录，首次打开可能需要几秒。'
+        $AnalyticsLoadingPanel.Visibility = 'Visible'
     }
     Start-AnalyticsRefreshAsync
 }
 
 function Show-CapacityView {
     $script:ViewMode = 'capacity'
+    Set-AccountBackdropBlur $false
+    $AccountFlyoutLayer.Visibility = 'Collapsed'
     $OrbView.Visibility = 'Collapsed'
     $AnalyticsBorder.Visibility = 'Collapsed'
     $ResetCreditsBorder.Visibility = 'Collapsed'
     $GlowBorder.Visibility = 'Visible'
-    Resize-WindowAroundCenter -Width 420 -Height 438
+    Resize-WindowAroundCenter -Width 420 -Height 410
     Update-ProgressFill
 }
 
@@ -2849,6 +3721,8 @@ function Apply-ResetCreditsSnapshot {
 
 function Show-ResetCreditsView {
     $script:ViewMode = 'reset-credits'
+    Set-AccountBackdropBlur $false
+    $AccountFlyoutLayer.Visibility = 'Collapsed'
     $OrbView.Visibility = 'Collapsed'
     $GlowBorder.Visibility = 'Collapsed'
     $AnalyticsBorder.Visibility = 'Collapsed'
@@ -2890,6 +3764,7 @@ function Start-DirectRefreshAsync {
         $workerInfo.Arguments = ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -DirectWorker' -f $script:ScriptPath)
         $workerInfo.UseShellExecute = $false
         $workerInfo.CreateNoWindow = $true
+        $workerInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $workerInfo.RedirectStandardOutput = $true
         $workerInfo.RedirectStandardError = $true
 
@@ -2907,6 +3782,7 @@ function Start-DirectRefreshAsync {
         $AnalyticsRefreshButton.Content = '···'
     } catch {
         Write-Diagnostic ('Unable to start direct worker: ' + $_.Exception.Message)
+        Complete-AccountIdentityVerification $false
     }
 }
 
@@ -2929,18 +3805,29 @@ function Complete-DirectRefreshIfReady {
             $RefreshButton.IsEnabled = $true
             $AnalyticsRefreshButton.Content = '↻'
             $AnalyticsRefreshButton.IsEnabled = $true
+            Complete-AccountIdentityVerification $false
             if ($runAgain) { Start-DirectRefreshAsync }
         }
         return
     }
 
+    $outputState = Get-WorkerOutputState $worker $script:DirectWorkerOutputTask $script:DirectWorkerErrorTask
+    if ($outputState -eq 'pending') { return }
+    $identitySynchronized = $false
     try {
+        if ($outputState -eq 'timeout') { throw '额度结果管道未关闭，请重试。' }
         $output = ([string]$script:DirectWorkerOutputTask.Result).Trim()
         $errorText = ([string]$script:DirectWorkerErrorTask.Result).Trim()
         if ($worker.ExitCode -eq 0 -and $output) {
             $wire = $output | ConvertFrom-Json
+            $identitySyncProperty = $wire.PSObject.Properties['IdentitySynchronized']
+            $identitySynchronized = [bool]($identitySyncProperty -and $identitySyncProperty.Value)
+            $customProviderProperty = $wire.PSObject.Properties['CustomProviderActive']
+            $customProviderActive = [bool]($customProviderProperty -and $customProviderProperty.Value)
             $script:AccountUsage = if ($wire.Usage) { $wire.Usage } else { $null }
-            if ($wire.Rates -and $wire.Rates.FiveHour -and $wire.Rates.Weekly) {
+            if ($customProviderActive) {
+                Apply-CustomProviderState
+            } elseif ($wire.Rates -and $wire.Rates.FiveHour -and $wire.Rates.Weekly) {
                 $fiveHourSnapshot = ConvertFrom-RateWire $wire.Rates.FiveHour
                 $weeklySnapshot = ConvertFrom-RateWire $wire.Rates.Weekly
                 Apply-RateWindows `
@@ -2980,6 +3867,7 @@ function Complete-DirectRefreshIfReady {
         $RefreshButton.IsEnabled = $true
         $AnalyticsRefreshButton.Content = '↻'
         $AnalyticsRefreshButton.IsEnabled = $true
+        Complete-AccountIdentityVerification $identitySynchronized
         if ($runAgain) {
             Start-DirectRefreshAsync
         }
@@ -3001,6 +3889,7 @@ function Start-ResetCreditsRefreshAsync {
         $workerInfo.Arguments = ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -ResetCreditsWorker' -f $script:ScriptPath)
         $workerInfo.UseShellExecute = $false
         $workerInfo.CreateNoWindow = $true
+        $workerInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $workerInfo.RedirectStandardOutput = $true
         $workerInfo.RedirectStandardError = $true
 
@@ -3008,6 +3897,9 @@ function Start-ResetCreditsRefreshAsync {
         $worker.StartInfo = $workerInfo
         [void]$worker.Start()
         $script:ResetCreditsWorkerProcess = $worker
+        $script:ResetCreditsWorkerOutputTask = $worker.StandardOutput.ReadToEndAsync()
+        $script:ResetCreditsWorkerErrorTask = $worker.StandardError.ReadToEndAsync()
+        $script:ResetCreditsWorkerStartedAt = [DateTime]::UtcNow
         $script:IsResetCreditsRefreshing = $true
         $ResetCreditsRefreshButton.IsEnabled = $false
         $ResetCreditsRefreshButton.Content = '···'
@@ -3021,11 +3913,25 @@ function Start-ResetCreditsRefreshAsync {
 
 function Complete-ResetCreditsRefreshIfReady {
     $worker = $script:ResetCreditsWorkerProcess
-    if (-not $worker -or -not $worker.HasExited) { return }
+    if (-not $worker) { return }
+    if (-not $worker.HasExited) {
+        if (([DateTime]::UtcNow - $script:ResetCreditsWorkerStartedAt).TotalSeconds -lt 20) { return }
+        Stop-OwnedProcess $worker
+        $script:ResetCreditsWorkerProcess = $null
+        $script:IsResetCreditsRefreshing = $false
+        $ResetCreditsRefreshButton.Content = '↻'
+        $ResetCreditsRefreshButton.IsEnabled = $true
+        $ResetCreditsRetryButton.IsEnabled = $true
+        Set-ResetCreditsState -Message '查询超时，请重试' -CanRetry
+        return
+    }
+    $outputState = Get-WorkerOutputState $worker $script:ResetCreditsWorkerOutputTask $script:ResetCreditsWorkerErrorTask
+    if ($outputState -eq 'pending') { return }
 
     try {
-        $output = $worker.StandardOutput.ReadToEnd().Trim()
-        [void]$worker.StandardError.ReadToEnd()
+        if ($outputState -eq 'timeout') { throw '重置卡结果管道未关闭，请重试。' }
+        $output = ([string]$script:ResetCreditsWorkerOutputTask.Result).Trim()
+        [void]$script:ResetCreditsWorkerErrorTask.Result
         if ($worker.ExitCode -ne 0 -or -not $output) {
             throw 'RESET_CREDITS_QUERY_FAILED'
         }
@@ -3070,12 +3976,18 @@ function Start-AnalyticsRefreshAsync {
         $AnalyticsRefreshButton.IsEnabled = $false
         $AnalyticsRefreshButton.Content = '···'
         $AnalyticsStatusText.Text = '正在增量汇总本地会话…'
+        if (-not $script:AnalyticsSnapshot) {
+            $AnalyticsLoadingTitle.Text = '正在整理本地使用记录'
+            $AnalyticsLoadingText.Text = '仅汇总本机已有记录，首次打开可能需要几秒。'
+            $AnalyticsLoadingPanel.Visibility = 'Visible'
+        }
 
         $workerInfo = New-Object System.Diagnostics.ProcessStartInfo
         $workerInfo.FileName = (Get-Command powershell.exe).Source
         $workerInfo.Arguments = ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -AnalyticsWorker' -f $script:ScriptPath)
         $workerInfo.UseShellExecute = $false
         $workerInfo.CreateNoWindow = $true
+        $workerInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $workerInfo.RedirectStandardOutput = $true
         $workerInfo.RedirectStandardError = $true
 
@@ -3090,6 +4002,11 @@ function Start-AnalyticsRefreshAsync {
     } catch {
         $script:IsAnalyticsRefreshing = $false
         $AnalyticsStatusText.Text = '本地统计失败：' + $_.Exception.Message
+        if (-not $script:AnalyticsSnapshot) {
+            $AnalyticsLoadingTitle.Text = '暂时无法读取统计'
+            $AnalyticsLoadingText.Text = '点击右上角刷新按钮重试；额度页仍可正常使用。'
+            $AnalyticsLoadingPanel.Visibility = 'Visible'
+        }
         Write-Diagnostic ('Analytics refresh failed: ' + $_.Exception.Message)
         $AnalyticsRefreshButton.IsEnabled = $true
         $AnalyticsRefreshButton.Content = '↻'
@@ -3108,13 +4025,21 @@ function Complete-AnalyticsRefreshIfReady {
             $script:AnalyticsWorkerErrorTask = $null
             $script:IsAnalyticsRefreshing = $false
             $AnalyticsStatusText.Text = '本地统计超时，请稍后重试'
+            if (-not $script:AnalyticsSnapshot) {
+                $AnalyticsLoadingTitle.Text = '统计用时较长'
+                $AnalyticsLoadingText.Text = '点击右上角刷新按钮稍后重试；额度页仍可正常使用。'
+                $AnalyticsLoadingPanel.Visibility = 'Visible'
+            }
             $AnalyticsRefreshButton.IsEnabled = $true
             $AnalyticsRefreshButton.Content = '↻'
         }
         return
     }
 
+    $outputState = Get-WorkerOutputState $worker $script:AnalyticsWorkerOutputTask $script:AnalyticsWorkerErrorTask
+    if ($outputState -eq 'pending') { return }
     try {
+        if ($outputState -eq 'timeout') { throw '统计结果管道未关闭，请重试。' }
         $output = ([string]$script:AnalyticsWorkerOutputTask.Result).Trim()
         $errorText = ([string]$script:AnalyticsWorkerErrorTask.Result).Trim()
         if ($worker.ExitCode -ne 0 -or -not $output) {
@@ -3127,6 +4052,11 @@ function Complete-AnalyticsRefreshIfReady {
         Apply-AnalyticsSnapshot $snapshot
     } catch {
         $AnalyticsStatusText.Text = '本地统计失败：' + $_.Exception.Message
+        if (-not $script:AnalyticsSnapshot) {
+            $AnalyticsLoadingTitle.Text = '暂时无法读取统计'
+            $AnalyticsLoadingText.Text = '点击右上角刷新按钮重试；额度页仍可正常使用。'
+            $AnalyticsLoadingPanel.Visibility = 'Visible'
+        }
         Write-Diagnostic ('Analytics refresh failed: ' + $_.Exception.Message)
     } finally {
         $worker.Dispose()
@@ -3297,15 +4227,65 @@ $OrbHitTarget.Add_MouseLeftButtonUp({
 $window.Add_MouseLeftButtonDown({
     param($sender, $eventArgs)
     if ($script:ViewMode -ne 'orb' -and $eventArgs.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) {
-        try { $window.DragMove() } catch {}
+        $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($window)
+        $cursor = [System.Windows.Forms.Cursor]::Position
+        $script:PanelDragOffsetX = ([double]$cursor.X / $dpi.DpiScaleX) - $window.Left
+        $script:PanelDragOffsetY = ([double]$cursor.Y / $dpi.DpiScaleY) - $window.Top
+        $script:PanelIsDragging = $window.CaptureMouse()
+        $eventArgs.Handled = $true
     }
 })
+
+$window.Add_MouseMove({
+    param($sender, $eventArgs)
+    if (-not $script:PanelIsDragging -or $eventArgs.LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed) { return }
+    $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($window)
+    $cursor = [System.Windows.Forms.Cursor]::Position
+    $window.Left = ([double]$cursor.X / $dpi.DpiScaleX) - $script:PanelDragOffsetX
+    $window.Top = ([double]$cursor.Y / $dpi.DpiScaleY) - $script:PanelDragOffsetY
+    Ensure-WindowInsideWorkArea
+    $eventArgs.Handled = $true
+})
+$window.Add_MouseLeftButtonUp({
+    if ($script:PanelIsDragging) {
+        $script:PanelIsDragging = $false
+        $window.ReleaseMouseCapture()
+    }
+})
+$window.Add_LostMouseCapture({ $script:PanelIsDragging = $false })
 
 $ProgressTrack.Add_SizeChanged({ Update-ProgressFill })
 $WeeklyProgressTrack.Add_SizeChanged({ Update-ProgressFill })
 
 $AnalyticsButton.Add_Click({ Show-AnalyticsView })
 $ResetCreditsButton.Add_Click({ Show-ResetCreditsView })
+$AccountSwitchButton.Add_Click({
+    if ($AccountFlyoutLayer.Visibility -eq [System.Windows.Visibility]::Visible) {
+        Hide-AccountFlyout
+    } else {
+        Show-AccountFlyout
+    }
+})
+$AccountFlyoutCloseButton.Add_Click({ Hide-AccountFlyout })
+$SaveCurrentAccountButton.Add_Click({ Start-AccountWorker -Action 'capture' })
+$AddAccountButton.Add_Click({ Start-AccountRegistration })
+$ImportCustomButton.Add_Click({
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = '选择同时包含 auth.json 和 config.toml 的文件夹'
+    $dialog.ShowNewFolderButton = $false
+    try {
+        if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $selectedDirectory = [IO.Path]::GetFullPath($dialog.SelectedPath)
+        if (-not (Test-Path -LiteralPath (Join-Path $selectedDirectory 'auth.json') -PathType Leaf) -or
+            -not (Test-Path -LiteralPath (Join-Path $selectedDirectory 'config.toml') -PathType Leaf)) {
+            $AccountFlyoutStatusText.Text = '所选文件夹必须同时包含 auth.json 和 config.toml。'
+            return
+        }
+        Start-AccountWorker -Action 'import-custom' -ImportDirectory $selectedDirectory
+    } finally {
+        $dialog.Dispose()
+    }
+})
 $OrbStyleToggleButton.Add_Click({
     $nextStyle = if ($script:OrbStyle -eq 'Gradient') { 'Classic' } else { 'Gradient' }
     Set-OrbStyleMode -Style $nextStyle -Persist
@@ -3391,10 +4371,22 @@ $resetCreditsWorkerTimer.Add_Tick({
     Complete-ResetCreditsRefreshIfReady
 })
 
+$OrbHitTarget.Add_LostMouseCapture({
+    $script:OrbIsDragging = $false
+    $script:OrbPointerMoved = $false
+})
+
 $analyticsWorkerTimer = New-Object System.Windows.Threading.DispatcherTimer
 $analyticsWorkerTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 $analyticsWorkerTimer.Add_Tick({
     Complete-AnalyticsRefreshIfReady
+})
+
+$accountWorkerTimer = New-Object System.Windows.Threading.DispatcherTimer
+$accountWorkerTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$accountWorkerTimer.Add_Tick({
+    Complete-AccountWorkerIfReady
+    Complete-AccountRegistrationIfReady
 })
 
 $eventTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -3449,6 +4441,7 @@ $window.Add_Loaded({
         $directWorkerTimer.Start()
         $resetCreditsWorkerTimer.Start()
         $analyticsWorkerTimer.Start()
+        $accountWorkerTimer.Start()
         $eventTimer.Start()
         $periodicRefreshTimer.Start()
     } elseif ($QAView -in @('daily', 'skill', 'skill-chain', 'agent', 'tool')) {
@@ -3468,6 +4461,9 @@ $window.Add_Loaded({
 
     $window.Dispatcher.BeginInvoke([Action]{
         if ($QARenderPath) {
+            if ($QACustomProvider) {
+                Apply-CustomProviderState
+            } else {
             $qaObservedAt = [DateTimeOffset]::Now
             $qaWeeklyRemaining = if ($QAFiveHourAvailable) {
                 [Math]::Min(100.0, $QARemaining + 21.0)
@@ -3509,6 +4505,7 @@ $window.Add_Loaded({
             $OfficialRateText.Text = ('官方额度：5h 已用 {0:0}% · 1周已用 {1:0}%' -f
                 (100.0 - $QARemaining), (100.0 - $qaWeeklyRemaining))
             Update-OrbWaterLevel $QARemaining -Immediate
+            }
         } else {
             Refresh-Data -TryDirect $false
             Start-DirectRefreshAsync
@@ -3516,6 +4513,10 @@ $window.Add_Loaded({
         switch ($QAView) {
             'orb' { Show-OrbView }
             'capacity' { Show-CapacityView }
+            'account' {
+                Show-CapacityView
+                Show-AccountFlyout
+            }
             'reset-credits' { Show-ResetCreditsView }
             'skill-chain' {
                 $script:ActiveAnalyticsTab = 'skill'
@@ -3575,6 +4576,7 @@ $window.Add_Closing({
     $directWorkerTimer.Stop()
     $resetCreditsWorkerTimer.Stop()
     $analyticsWorkerTimer.Stop()
+    $accountWorkerTimer.Stop()
     $eventTimer.Stop()
     $periodicRefreshTimer.Stop()
     $waveTimer.Stop()
@@ -3584,6 +4586,8 @@ $window.Add_Closing({
     $script:ResetCreditsWorkerProcess = $null
     Stop-OwnedProcess $script:AnalyticsWorkerProcess
     $script:AnalyticsWorkerProcess = $null
+    Stop-OwnedProcess $script:AccountWorkerProcess
+    $script:AccountWorkerProcess = $null
     $notifyIcon.Visible = $false
     $notifyIcon.Dispose()
     if ($script:TrayIconResource) {

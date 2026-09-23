@@ -19,11 +19,11 @@ Codex Quota Orb is a lightweight, local-first Windows widget. Its liquid orb is 
 
 | Updated | Version | Categories |
 | --- | --- | --- |
-| 2026-08-26 | 1.4.0 | Quota-first UI · Skill/Agent/Tool analytics · 0 Token |
+| 2026-09-23 | 1.5.2 | Per-account reauthentication · automatic session continuation · safer account switching |
 
-- **Complete Skill view:** separates locally installed Skills from the latest available-Skill catalog observed in Codex sessions, including system and plugin scopes.
-- **Repeated attribution:** gives every participating Skill the Turn's Token total while keeping unique coverage and terminal-Skill attribution available as separate fields.
-- **Simple workflow detail:** keeps quota and Token first, then shows readable Skill status, Agent completion/activity, and all locally recorded Tool categories. MCP is treated as one Tool category instead of a separate technical page.
+- **Two ChatGPT subscriptions plus custom providers:** register browser-authenticated monthly accounts and import an `auth.json` + `config.toml` provider from the quota panel.
+- **Continuity across switches:** active turns are interrupted before the global identity changes, then loaded sessions reopen in visible terminals under the selected identity.
+- **Safe quota recovery:** quota-failure text is never resubmitted as an instruction. The switcher forks before the failed turn when possible and continues from the original request and current workspace state.
 
 ## Choose your orb style
 
@@ -41,7 +41,8 @@ Both styles have the same quota, Reset Credits, analytics, privacy, and tray fea
 - Daily account token trends when the account usage interface is available.
 - Installed/available Skill inventory, repeated participating attribution, multi-Skill chains, Agent hierarchy, and Tool analytics.
 - Floating liquid-glass orb, expandable panel, drag support, and system tray controls.
-- No telemetry, ads, analytics service, or model calls; the widget itself consumes 0 model Tokens.
+- Liquid-glass identity chooser for multiple ChatGPT subscription accounts and encrypted custom-provider profiles.
+- No telemetry, ads, or analytics service. Passive monitoring and local analytics consume 0 model Tokens; explicitly resuming an interrupted Codex task continues that task's normal model usage.
 - Runs as native PowerShell/WPF; Python is only needed for the optional analytics page.
 
 ## Read-only Reset Credits
@@ -55,6 +56,25 @@ Both styles have the same quota, Reset Credits, analytics, privacy, and tray fea
 - Numbers cards and sorts them by the earliest expiry time.
 - Queries once when the page opens; its refresh button only updates the Reset Credits page and does not replace the displayed quota snapshot.
 - Provides explicit empty and retry states, with no redeem, reset, purchase, or top-up action.
+
+## Account and configuration switching
+
+The `⇄` button sits immediately left of the orb-style button on the expanded quota view.
+
+1. Choose **Save current** once while signed into the first ChatGPT subscription.
+2. Choose **Add account** and complete the official `codex login` browser flow for the second subscription. Enrollment uses an isolated temporary Codex Home and never logs out the currently active identity. Each saved ChatGPT account also has its own **Verify** button for refreshing that account's login.
+3. Choose **Import config** to select a folder containing the custom provider's `auth.json` and `config.toml`.
+4. Select an inactive row to switch globally. Select the active row to open a new managed Codex terminal with the correct profile.
+
+The installer also creates **Codex - Active Identity** in the Start Menu. That launcher reads the switcher's current identity and applies its profile automatically before starting a normal interactive Codex terminal.
+
+Switching is intentionally global because Codex keeps one active ChatGPT login cache. Before touching the active login, the widget validates the destination account and identifies each open CLI terminal's persisted session by its explicit resume ID or process start time. It then closes the old terminals, swaps the encrypted local credential, restarts the local app-server daemon, and opens the matched sessions automatically under the selected identity. An idle session reopens without an injected prompt. An in-progress turn receives a continuation request after reopening; work already written to disk is retained. If a turn ended on a quota-exhaustion error, that error is excluded from the continuation instruction; the original request is continued from the last safe point instead.
+
+If an open terminal cannot be matched to its session, switching stops before changing the login. If a later switch step fails after old terminals close, the widget restores the previous login and reopens the affected sessions.
+
+If a saved ChatGPT account needs browser sign-in again, its row changes to **Reauthenticate**. Selecting an expired account during a switch opens the same official browser flow automatically. The widget checks that the signed-in email matches the selected row before replacing that row's encrypted credential; after successful sign-in it switches to that identity and reopens the previous CLI sessions. Canceling or signing in with another email leaves the current identity unchanged.
+
+Inactive ChatGPT rows show the last observed quota and timestamp. The current row uses live quota. Custom-provider quota may remain unknown. This feature never redeems Reset Credits and never calls a Reset Credit consumption method.
 
 ## Install
 
@@ -99,6 +119,7 @@ GitHub Releases also provides two portable packages: `Classic.zip` and `Gradient
 - Select **View usage analytics** for Token, Skill, Agent, and Tool views.
 - Use **—** to collapse back to the orb.
 - Use the system tray icon to open, refresh, or exit.
+- Use the `⇄` identity button to switch accounts/configurations or open a new terminal under the active identity.
 
 To start it manually, open **Codex Quota Orb** from the Start Menu or run:
 
@@ -128,8 +149,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexRateWidget.ps1 -OrbSt
 Codex Quota Orb is local-first:
 
 - It reads quota, account usage, and Reset Credits through the locally installed Codex app server, and reads local Codex session files for fallback and attribution.
-- It does not read `auth.json`, handle the Codex ChatGPT access token, or call an internal ChatGPT backend endpoint.
-- It sends no widget telemetry and makes no model-generation requests.
+- When the account switcher is used, it reads the local Codex `auth.json`, encrypts inactive credentials with Windows CurrentUser DPAPI, and restores only the selected ChatGPT login to the normal Codex cache.
+- Imported custom-provider API keys are DPAPI-encrypted and exposed only to the managed Codex process through the provider's configured environment-variable name.
+- It sends no widget telemetry. Passive monitoring makes no model-generation request; account switching may deliberately resume the user's interrupted task through the selected Codex identity.
 - Runtime data stays under `%LOCALAPPDATA%\CodexRateWidget`.
 
 See [PRIVACY.md](PRIVACY.md) for the exact data boundary.

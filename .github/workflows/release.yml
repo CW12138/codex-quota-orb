@@ -18,6 +18,10 @@ jobs:
         run: |
           $packageFiles = @(
             'CodexRateWidget.ps1',
+            'AccountSwitcher.psm1',
+            'Resume-CodexSession.ps1',
+            'Register-CodexAccount.ps1',
+            'Launch-ActiveCodex.ps1',
             'UsageAnalytics.py',
             'Watch-CodexAndLaunchWidget.ps1',
             'Launch-CodexRateWidget.vbs',

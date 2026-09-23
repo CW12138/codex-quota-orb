@@ -13,6 +13,10 @@ Set-StrictMode -Version 2.0
 $repository = 'CW12138/codex-quota-orb'
 $requiredFiles = @(
     'CodexRateWidget.ps1',
+    'AccountSwitcher.psm1',
+    'Resume-CodexSession.ps1',
+    'Register-CodexAccount.ps1',
+    'Launch-ActiveCodex.ps1',
     'UsageAnalytics.py',
     'Watch-CodexAndLaunchWidget.ps1',
     'Launch-CodexRateWidget.vbs',
@@ -129,12 +133,21 @@ try {
     if (-not $NoShortcuts) {
         $programsDirectory = [Environment]::GetFolderPath('Programs')
         $startMenuShortcut = Join-Path $programsDirectory 'Codex Quota Orb.lnk'
+        $activeCodexShortcut = Join-Path $programsDirectory 'Codex - Active Identity.lnk'
         $uninstallShortcut = Join-Path $programsDirectory 'Uninstall Codex Quota Orb.lnk'
         $powershellPath = (Get-Command powershell.exe).Source
+        $defaultWorkspaceDirectory = if (Test-Path -LiteralPath 'D:\myGPT' -PathType Container) {
+            'D:\myGPT'
+        } else {
+            [Environment]::GetFolderPath('UserProfile')
+        }
 
         New-Shortcut -Path $startMenuShortcut -Target $wscriptPath `
             -Arguments ('"{0}"' -f (Join-Path $resolvedInstallDirectory 'Launch-CodexRateWidget.vbs')) `
             -WorkingDirectory $resolvedInstallDirectory -Description 'Open Codex Quota Orb'
+        New-Shortcut -Path $activeCodexShortcut -Target $powershellPath `
+            -Arguments ('-NoLogo -NoExit -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $resolvedInstallDirectory 'Launch-ActiveCodex.ps1')) `
+            -WorkingDirectory $defaultWorkspaceDirectory -Description 'Open Codex with the active Codex Quota Orb identity'
         New-Shortcut -Path $uninstallShortcut -Target $powershellPath `
             -Arguments ('-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $resolvedInstallDirectory 'Uninstall.ps1')) `
             -WorkingDirectory $resolvedInstallDirectory -Description 'Uninstall Codex Quota Orb'

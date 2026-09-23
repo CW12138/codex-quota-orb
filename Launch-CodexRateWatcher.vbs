@@ -5,6 +5,7 @@ Set shell = CreateObject("WScript.Shell")
 Set fileSystem = CreateObject("Scripting.FileSystemObject")
 
 scriptDir = fileSystem.GetParentFolderName(WScript.ScriptFullName)
+shell.CurrentDirectory = scriptDir
 command = "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ _
     & scriptDir & "\Watch-CodexAndLaunchWidget.ps1"""
 

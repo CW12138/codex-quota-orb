@@ -64,4 +64,39 @@ if ($sessionReadReferences -ne 3) {
     throw ('Unexpected session-reader call count; UI code may have regressed: ' + $sessionReadReferences)
 }
 
+Invoke-Expression (Get-FunctionAst 'Get-WorkerOutputState').Extent.Text
+$unfinished = New-Object 'System.Threading.Tasks.TaskCompletionSource[string]'
+$finished = New-Object 'System.Threading.Tasks.TaskCompletionSource[string]'
+$finished.SetResult('done')
+$exitedWorker = [pscustomobject]@{ ExitTime = [DateTime]::Now }
+$timer = [Diagnostics.Stopwatch]::StartNew()
+if ((Get-WorkerOutputState $exitedWorker $unfinished.Task $finished.Task) -ne 'pending') {
+    throw 'An inherited output pipe must remain pending without blocking the dispatcher.'
+}
+if ($timer.ElapsedMilliseconds -gt 500) { throw 'Worker readiness check blocked the dispatcher.' }
+$exitedWorker.ExitTime = [DateTime]::Now.AddSeconds(-6)
+if ((Get-WorkerOutputState $exitedWorker $unfinished.Task $finished.Task) -ne 'timeout') {
+    throw 'An inherited pipe must time out after the worker exits.'
+}
+if ((Get-WorkerOutputState $exitedWorker $finished.Task $finished.Task) -ne 'ready') {
+    throw 'Completed output must remain readable even after the deadline.'
+}
+if ((Get-WorkerOutputState $exitedWorker $finished.Task $unfinished.Task -ResultLine) -ne 'ready') {
+    throw 'A complete account result line must remain readable while a descendant holds stderr open.'
+}
+$accountStart = (Get-FunctionAst 'Start-AccountWorker').Extent.Text
+if (-not $accountStart.Contains('StandardOutput.ReadLineAsync()')) {
+    throw 'Account workers must read their flushed result line without waiting for pipe EOF.'
+}
+foreach ($name in @('Complete-AccountWorkerIfReady', 'Complete-DirectRefreshIfReady', 'Complete-ResetCreditsRefreshIfReady', 'Complete-AnalyticsRefreshIfReady')) {
+    $body = (Get-FunctionAst $name).Extent.Text
+    if (-not $body.Contains('Get-WorkerOutputState') -or $body.Contains('.ReadToEnd()')) {
+        throw ($name + ' can block on worker output.')
+    }
+}
+if ($source.Contains('$window.DragMove()')) { throw 'Panel dragging must not enter a nested modal dispatcher loop.' }
+if ($source.Contains('$AnalyticsSourceText.Text = ($dailyView.Source + '' · 0 TOKEN'')')) {
+    throw 'Analytics source badge must display the refreshed token total.'
+}
+
 Write-Output 'UI_RESPONSIVENESS_TESTS=PASS'

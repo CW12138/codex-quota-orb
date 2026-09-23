@@ -6,13 +6,13 @@ $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Encoding UTF8 
 $widget = Get-Content -LiteralPath (Join-Path $root 'CodexRateWidget.ps1') -Encoding UTF8 -Raw
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.md') -Encoding UTF8 -Raw
 
-if ($version -ne '1.4.0') {
+if ($version -ne '1.5.2') {
     throw ('Unexpected VERSION value: ' + $version)
 }
 if (-not $widget.Contains(("version = '{0}'" -f $version))) {
     throw 'The app-server handshake version does not match VERSION.'
 }
-if (-not $readme.Contains(('| 2026-08-26 | {0} |' -f $version))) {
+if (-not $readme.Contains(('| 2026-09-23 | {0} |' -f $version))) {
     throw 'The README latest-update row does not match VERSION.'
 }
 if ($widget -match 'CodexQuotaOrb/\d+\.\d+\.\d+') {

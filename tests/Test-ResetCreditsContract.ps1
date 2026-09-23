@@ -30,7 +30,6 @@ foreach ($fragment in $requiredFragments) {
 }
 
 foreach ($forbiddenPattern in @(
-    'auth\.json',
     'backend-api',
     'Invoke-RestMethod',
     'rateLimitResetCredit/consume',
@@ -38,6 +37,18 @@ foreach ($forbiddenPattern in @(
 )) {
     if ($source -match $forbiddenPattern) {
         throw ('Forbidden reset-credits behavior or text found: ' + $forbiddenPattern)
+    }
+}
+
+$resetCreditFunctions = @($ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -match 'ResetCredits?'
+}, $true))
+$resetCreditSource = ($resetCreditFunctions | ForEach-Object { $_.Extent.Text }) -join [Environment]::NewLine
+foreach ($forbiddenPattern in @('auth\.json', 'backend-api', 'Invoke-RestMethod', 'consume')) {
+    if ($resetCreditSource -match $forbiddenPattern) {
+        throw ('The Reset Credits implementation crossed its read-only boundary: ' + $forbiddenPattern)
     }
 }
 
